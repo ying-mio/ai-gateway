@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 
 import requests
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
 load_dotenv()
@@ -20,6 +20,7 @@ logger = logging.getLogger("ai_gateway")
 
 # ---- config ----
 PROJECT_NAME = "ai-gateway"
+GATEWAY_TOKEN = os.getenv("GATEWAY_TOKEN")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini")
 OPENROUTER_URL = os.getenv("OPENROUTER_URL", "https://openrouter.ai/api/v1/chat/completions")
@@ -27,6 +28,8 @@ OPENROUTER_TIMEOUT = float(os.getenv("OPENROUTER_TIMEOUT", "60"))
 
 if not OPENROUTER_API_KEY:
     raise RuntimeError("Missing OPENROUTER_API_KEY in .env")
+if not GATEWAY_TOKEN:
+    raise RuntimeError("Missing GATEWAY_TOKEN in .env")
 
 app = FastAPI(title="AI Gateway (Minimal)")
 
@@ -54,7 +57,10 @@ def health():
 
 
 @app.post("/chat", response_model=ChatOut)
-def chat(payload: ChatIn):
+def chat(payload: ChatIn, x_api_key: str | None = Header(default=None, alias="X-API-Key")):
+    if x_api_key != GATEWAY_TOKEN:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
     request_id = str(uuid.uuid4())
     start = time.perf_counter()
 
