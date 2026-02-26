@@ -22,7 +22,7 @@ logger = logging.getLogger("ai_gateway")
 PROJECT_NAME = "ai-gateway"
 GATEWAY_TOKEN = os.getenv("GATEWAY_TOKEN")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini")
+DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini"))
 OPENROUTER_URL = os.getenv("OPENROUTER_URL", "https://openrouter.ai/api/v1/chat/completions")
 OPENROUTER_TIMEOUT = float(os.getenv("OPENROUTER_TIMEOUT", "60"))
 
@@ -36,11 +36,18 @@ app = FastAPI(title="AI Gateway (Minimal)")
 
 class ChatIn(BaseModel):
     message: str
+    model: str | None = None
+    system: str | None = None
+    temperature: float | None = None
+    max_tokens: int | None = None
 
 
 class ChatOut(BaseModel):
     reply: str
     model: str
+    request_id: str
+    duration_ms: float
+    upstream_status: int
 
 
 @app.get("/")
@@ -72,10 +79,19 @@ def chat(payload: ChatIn, x_api_key: str | None = Header(default=None, alias="X-
         "X-Title": os.getenv("OPENROUTER_TITLE", "ai-gateway-minimal"),
     }
 
+    model = payload.model or DEFAULT_MODEL
+    messages = [{"role": "user", "content": payload.message}]
+    if payload.system:
+        messages.insert(0, {"role": "system", "content": payload.system})
+
     data = {
-        "model": OPENROUTER_MODEL,
-        "messages": [{"role": "user", "content": payload.message}],
+        "model": model,
+        "messages": messages,
     }
+    if payload.temperature is not None:
+        data["temperature"] = payload.temperature
+    if payload.max_tokens is not None:
+        data["max_tokens"] = payload.max_tokens
 
     upstream_status = None
     try:
@@ -131,4 +147,10 @@ def chat(payload: ChatIn, x_api_key: str | None = Header(default=None, alias="X-
         len(payload.message),
     )
 
-    return ChatOut(reply=reply, model=OPENROUTER_MODEL)
+    return ChatOut(
+        reply=reply,
+        model=model,
+        request_id=request_id,
+        duration_ms=duration_ms,
+        upstream_status=upstream_status,
+    )
