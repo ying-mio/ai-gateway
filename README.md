@@ -19,7 +19,7 @@ pip install -r requirements.txt
 ```env
 GATEWAY_TOKEN=your_gateway_token
 OPENROUTER_API_KEY=your_openrouter_key
-OPENROUTER_MODEL=openai/gpt-4o-mini
+DEFAULT_MODEL=openai/gpt-4o-mini
 OPENROUTER_URL=https://openrouter.ai/api/v1/chat/completions
 OPENROUTER_TIMEOUT=60
 OPENROUTER_REFERER=http://localhost
@@ -39,6 +39,12 @@ $headers = @{
 }
 $body = '{"message":"你好"}'
 Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8000/chat" -Headers $headers -Body $body
+
+# 可选字段示例（model / system / temperature / max_tokens）
+$body2 = '{"message":"你好","model":"openai/gpt-4o-mini","system":"你是简洁助手","temperature":0.7,"max_tokens":256}'
+Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8000/chat" -Headers $headers -Body $body2
 ```
 
 未提供或提供错误 `X-API-Key` 时，`/chat` 返回 `401 Unauthorized`。
+
+`/chat` 响应包含：`reply`、`model`、`request_id`、`duration_ms`、`upstream_status`。
