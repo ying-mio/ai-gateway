@@ -19,7 +19,7 @@ pip install -r requirements.txt
 ```env
 GATEWAY_TOKEN=your_gateway_token
 OPENROUTER_API_KEY=your_openrouter_key
-DEFAULT_MODEL=openai/gpt-4o-mini
+OPENROUTER_MODEL=openai/gpt-4o-mini
 OPENROUTER_URL=https://openrouter.ai/api/v1/chat/completions
 OPENROUTER_TIMEOUT=60
 OPENROUTER_REFERER=http://localhost
@@ -31,19 +31,14 @@ OPENROUTER_TITLE=ai-gateway-minimal
 python -m uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
-## /chat 请求体
-- 必填：`message`
-- 可选：`model`、`system`、`temperature`、`max_tokens`
-- 默认模型：`DEFAULT_MODEL`
-
 ## 调用示例（必须带鉴权头）
 ```powershell
 $headers = @{
   "Content-Type" = "application/json"
   "X-API-Key" = "your_gateway_token"
 }
-$body = '{"message":"你好","temperature":0.7,"max_tokens":128}'
+$body = '{"message":"你好"}'
 Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8000/chat" -Headers $headers -Body $body
 ```
 
-响应包含：`reply`、`model`、`request_id`、`duration_ms`、`upstream_status`。
+未提供或提供错误 `X-API-Key` 时，`/chat` 返回 `401 Unauthorized`。

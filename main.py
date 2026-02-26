@@ -147,10 +147,4 @@ def chat(payload: ChatIn, x_api_key: str | None = Header(default=None, alias="X-
         len(payload.message),
     )
 
-    return ChatOut(
-        reply=reply,
-        model=selected_model,
-        request_id=request_id,
-        duration_ms=duration_ms,
-        upstream_status=upstream_status,
-    )
+    return ChatOut(reply=reply, model=OPENROUTER_MODEL)
