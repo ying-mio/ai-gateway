@@ -31,6 +31,16 @@ OPENROUTER_TITLE=ai-gateway-minimal
 python -m uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
+
+## Windows PowerShell 一键测试命令
+```powershell
+# 测试 /health
+Invoke-RestMethod -Method Get -Uri "http://127.0.0.1:8000/health"
+
+# 测试 /chat
+$headers = @{ "Content-Type" = "application/json"; "X-API-Key" = "your_gateway_token" }; $body = '{"message":"你好"}'; Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8000/chat" -Headers $headers -Body $body
+```
+
 ## 调用示例（必须带鉴权头）
 ```powershell
 $headers = @{
