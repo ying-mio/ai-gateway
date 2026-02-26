@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 
 import requests
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
 load_dotenv()
@@ -20,24 +20,34 @@ logger = logging.getLogger("ai_gateway")
 
 # ---- config ----
 PROJECT_NAME = "ai-gateway"
+GATEWAY_TOKEN = os.getenv("GATEWAY_TOKEN")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini")
+DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "openai/gpt-4o-mini")
 OPENROUTER_URL = os.getenv("OPENROUTER_URL", "https://openrouter.ai/api/v1/chat/completions")
 OPENROUTER_TIMEOUT = float(os.getenv("OPENROUTER_TIMEOUT", "60"))
 
 if not OPENROUTER_API_KEY:
     raise RuntimeError("Missing OPENROUTER_API_KEY in .env")
+if not GATEWAY_TOKEN:
+    raise RuntimeError("Missing GATEWAY_TOKEN in .env")
 
 app = FastAPI(title="AI Gateway (Minimal)")
 
 
 class ChatIn(BaseModel):
     message: str
+    model: str | None = None
+    system: str | None = None
+    temperature: float | None = None
+    max_tokens: int | None = None
 
 
 class ChatOut(BaseModel):
     reply: str
     model: str
+    request_id: str
+    duration_ms: float
+    upstream_status: int | None
 
 
 @app.get("/")
@@ -54,22 +64,34 @@ def health():
 
 
 @app.post("/chat", response_model=ChatOut)
-def chat(payload: ChatIn):
+def chat(payload: ChatIn, x_api_key: str | None = Header(default=None, alias="X-API-Key")):
+    if x_api_key != GATEWAY_TOKEN:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
     request_id = str(uuid.uuid4())
     start = time.perf_counter()
 
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
-        # OpenRouter 可选推荐字段
         "HTTP-Referer": os.getenv("OPENROUTER_REFERER", "http://localhost"),
         "X-Title": os.getenv("OPENROUTER_TITLE", "ai-gateway-minimal"),
     }
 
+    selected_model = payload.model or DEFAULT_MODEL
+    messages = []
+    if payload.system:
+        messages.append({"role": "system", "content": payload.system})
+    messages.append({"role": "user", "content": payload.message})
+
     data = {
-        "model": OPENROUTER_MODEL,
-        "messages": [{"role": "user", "content": payload.message}],
+        "model": selected_model,
+        "messages": messages,
     }
+    if payload.temperature is not None:
+        data["temperature"] = payload.temperature
+    if payload.max_tokens is not None:
+        data["max_tokens"] = payload.max_tokens
 
     upstream_status = None
     try:
@@ -125,4 +147,10 @@ def chat(payload: ChatIn):
         len(payload.message),
     )
 
-    return ChatOut(reply=reply, model=OPENROUTER_MODEL)
+    return ChatOut(
+        reply=reply,
+        model=selected_model,
+        request_id=request_id,
+        duration_ms=duration_ms,
+        upstream_status=upstream_status,
+    )
