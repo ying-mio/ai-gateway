@@ -9,8 +9,6 @@ from typing import Any, Literal
 import httpx
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
-from fastapi.responses import StreamingResponse
-from starlette.background import BackgroundTask
 from pydantic import BaseModel, ConfigDict, Field
 
 load_dotenv()
@@ -59,21 +57,6 @@ def _resolve_upstream_api_key() -> str | None:
         if value:
             return value
     return None
-
-
-
-async def _aclose_upstream_response(resp: httpx.Response, client: httpx.AsyncClient) -> None:
-    await resp.aclose()
-    await client.aclose()
-
-
-def _upstream_chat_headers(api_key: str) -> dict[str, str]:
-    return {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": OPENROUTER_REFERER,
-        "X-Title": OPENROUTER_TITLE,
-    }
 
 app = FastAPI(title="AI Gateway")
 
