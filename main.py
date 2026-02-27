@@ -65,9 +65,68 @@ def health():
 
 @app.post("/chat", response_model=ChatOut)
 def chat(payload: ChatIn, x_api_key: str | None = Header(default=None, alias="X-API-Key")):
-    if x_api_key != GATEWAY_TOKEN:
+     authorization: str | None = Header(default=None, alias="Authorization"),
+):
+    _check_gateway_key(x_api_key, authorization)
+
+from fastapi import Request
+
+@app.post("/v1/chat/completions", response_model=ChatOut)
+async def chat_completions_alias(
+    request: Request,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    authorization: str | None = Header(default=None, alias="Authorization"),
+):
+    _check_gateway_key(x_api_key, authorization)
+
+    body = await request.json()
+
+    # OpenAI style: {"messages":[{"role":"user","content":"hi"}, ...]}
+    if "messages" in body and isinstance(body["messages"], list):
+        # 取最后一条 user 消息作为输入
+        user_text = ""
+        for m in reversed(body["messages"]):
+            if m.get("role") == "user":
+                user_text = m.get("content", "")
+                break
+        payload = ChatIn(message=user_text)
+    else:
+        # 兼容你原来的 {"message":"hi"}
+        payload = ChatIn(**body)
+
+    # 复用你现有的 chat 逻辑（如果你 chat() 是函数）
+    return chat(payload, x_api_key)
+from fastapi import Header, HTTPException
+import os
+import httpx
+
+def _check_gateway_key(x_api_key: str | None, authorization: str | None):
+    token = os.getenv("GATEWAY_TOKEN")
+    bearer = None
+    if authorization and authorization.lower().startswith("bearer "):
+        bearer = authorization.split(" ", 1)[1].strip()
+    if (x_api_key != token) and (bearer != token):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
+@app.get("/v1/models")
+async def v1_models(
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    authorization: str | None = Header(default=None, alias="Authorization"),
+):
+    _check_gateway_key(x_api_key, authorization)
+
+    upstream_key = os.getenv("OPENROUTER_API_KEY")
+    if not upstream_key:
+        raise HTTPException(status_code=500, detail="Missing OPENROUTER_API_KEY")
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.get(
+            "https://openrouter.ai/api/v1/models",
+            headers={"Authorization": f"Bearer {upstream_key}"},
+        )
+
+    # OpenRouter 正常会给 JSON
+    return r.json()
     request_id = str(uuid.uuid4())
     start = time.perf_counter()
 
