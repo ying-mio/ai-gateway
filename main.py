@@ -31,7 +31,9 @@ AVAILABLE_MODELS = _csv_env("AVAILABLE_MODELS") or [DEFAULT_MODEL]
 UPSTREAM_BASE_URL = os.getenv("UPSTREAM_BASE_URL", "https://openrouter.ai/api/v1").strip().rstrip("/")
 UPSTREAM_TIMEOUT = float(os.getenv("UPSTREAM_TIMEOUT", os.getenv("OPENROUTER_TIMEOUT", "60")))
 
-OPENROUTER_URL = os.getenv("OPENROUTER_URL", "https://openrouter.ai/api/v1/chat/completions")
+CHAT_COMPLETIONS_URL = os.getenv("UPSTREAM_CHAT_URL", os.getenv("OPENROUTER_URL", "")).strip()
+if not CHAT_COMPLETIONS_URL:
+    CHAT_COMPLETIONS_URL = f"{UPSTREAM_BASE_URL}/chat/completions"
 OPENROUTER_TIMEOUT = float(os.getenv("OPENROUTER_TIMEOUT", "60"))
 OPENROUTER_REFERER = os.getenv("OPENROUTER_REFERER", "http://localhost")
 OPENROUTER_TITLE = os.getenv("OPENROUTER_TITLE", "ai-gateway")
@@ -158,7 +160,7 @@ async def _call_upstream(payload: OpenAIChatRequest, request_id: str) -> tuple[s
 
         try:
             async with httpx.AsyncClient(timeout=OPENROUTER_TIMEOUT) as client:
-                resp = await client.post(OPENROUTER_URL, headers=headers, json=body)
+                resp = await client.post(CHAT_COMPLETIONS_URL, headers=headers, json=body)
         except httpx.RequestError as exc:
             raise HTTPException(status_code=502, detail=f"Upstream request failed: {exc.__class__.__name__}") from exc
 
