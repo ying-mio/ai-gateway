@@ -12,6 +12,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict
 from starlette.background import BackgroundTask
+from pydantic import BaseModel, ConfigDict, Field
 
 load_dotenv()
 
@@ -30,10 +31,15 @@ PROVIDER = os.getenv("PROVIDER", "openrouter").strip().lower()
 GATEWAY_TOKEN = os.getenv("GATEWAY_TOKEN", "").strip()
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "openai/gpt-4o-mini").strip()
 AVAILABLE_MODELS = _csv_env("AVAILABLE_MODELS") or [DEFAULT_MODEL]
+UPSTREAM_BASE_URL = os.getenv("UPSTREAM_BASE_URL", "https://openrouter.ai/api/v1").strip().rstrip("/")
+UPSTREAM_TIMEOUT = float(os.getenv("UPSTREAM_TIMEOUT", os.getenv("OPENROUTER_TIMEOUT", "60")))
 
 UPSTREAM_BASE_URL = os.getenv("UPSTREAM_BASE_URL", "https://openrouter.ai/api/v1").strip().rstrip("/")
 CHAT_COMPLETIONS_URL = os.getenv("UPSTREAM_CHAT_URL", os.getenv("OPENROUTER_URL", "")).strip() or f"{UPSTREAM_BASE_URL}/chat/completions"
 UPSTREAM_TIMEOUT = float(os.getenv("UPSTREAM_TIMEOUT", os.getenv("OPENROUTER_TIMEOUT", "60")))
+CHAT_COMPLETIONS_URL = os.getenv("UPSTREAM_CHAT_URL", os.getenv("OPENROUTER_URL", "")).strip()
+if not CHAT_COMPLETIONS_URL:
+    CHAT_COMPLETIONS_URL = f"{UPSTREAM_BASE_URL}/chat/completions"
 OPENROUTER_TIMEOUT = float(os.getenv("OPENROUTER_TIMEOUT", "60"))
 OPENROUTER_REFERER = os.getenv("OPENROUTER_REFERER", "http://localhost")
 OPENROUTER_TITLE = os.getenv("OPENROUTER_TITLE", "ai-gateway")
@@ -52,6 +58,13 @@ if not GEMINI_API_KEYS:
 if not GATEWAY_TOKEN:
     raise RuntimeError("Missing GATEWAY_TOKEN in environment")
 
+
+def _resolve_upstream_api_key() -> str | None:
+    for key_name in ("OPENROUTER_API_KEY", "UPSTREAM_API_KEY", "OPENAI_API_KEY"):
+        value = os.getenv(key_name, "").strip()
+        if value:
+            return value
+    return None
 
 app = FastAPI(title="AI Gateway")
 
@@ -166,6 +179,7 @@ async def _call_upstream(payload: OpenAIChatRequest, request_id: str) -> tuple[s
         if not api_key:
             raise HTTPException(status_code=502, detail="Upstream openrouter not configured: missing API key")
 
+        headers = _upstream_chat_headers(api_key)
         body: dict[str, Any] = {"model": model, "messages": [m.model_dump() for m in payload.messages]}
         if payload.temperature is not None:
             body["temperature"] = payload.temperature
@@ -176,6 +190,8 @@ async def _call_upstream(payload: OpenAIChatRequest, request_id: str) -> tuple[s
             async with httpx.AsyncClient(timeout=OPENROUTER_TIMEOUT) as client:
                 resp = await client.post(CHAT_COMPLETIONS_URL, headers=_upstream_headers(api_key), json=body)
         except Exception as exc:  # noqa: BLE001
+                resp = await client.post(CHAT_COMPLETIONS_URL, headers=headers, json=body)
+        except httpx.RequestError as exc:
             raise HTTPException(status_code=502, detail=f"Upstream request failed: {exc.__class__.__name__}") from exc
 
         if resp.status_code >= 400:
@@ -257,6 +273,12 @@ async def list_models():
     try:
         async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT) as client:
             upstream_resp = await client.get(f"{UPSTREAM_BASE_URL}/models", headers={"Authorization": f"Bearer {upstream_key}"})
+    models_url = f"{UPSTREAM_BASE_URL}/models"
+    headers = {"Authorization": f"Bearer {upstream_key}"}
+
+    try:
+        async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT) as client:
+            upstream_resp = await client.get(models_url, headers=headers)
     except Exception as exc:  # noqa: BLE001
         logger.warning("/v1/models upstream request failed: %s", exc.__class__.__name__)
         raise HTTPException(status_code=502, detail="Upstream error") from exc
@@ -264,6 +286,11 @@ async def list_models():
     if upstream_resp.status_code != 200:
         content_type = upstream_resp.headers.get("content-type", "application/json")
         return Response(content=upstream_resp.content, status_code=upstream_resp.status_code, media_type=content_type.split(";", 1)[0])
+        return Response(
+            content=upstream_resp.content,
+            status_code=upstream_resp.status_code,
+            media_type=content_type.split(";", 1)[0],
+        )
 
     try:
         return upstream_resp.json()
@@ -324,6 +351,37 @@ async def chat_completions(request: Request):
     except Exception as exc:  # noqa: BLE001
         if client is not None:
             await client.aclose()
+    stream = bool(payload.get("stream"))
+    headers = _upstream_chat_headers(api_key)
+
+    if not stream:
+        try:
+            async with httpx.AsyncClient(timeout=OPENROUTER_TIMEOUT) as client:
+                upstream_resp = await client.post(OPENROUTER_URL, headers=headers, json=payload)
+        except httpx.RequestError as exc:
+            logger.warning("/v1/chat/completions upstream request failed: %s", exc.__class__.__name__)
+            raise HTTPException(status_code=502, detail="Upstream error") from exc
+
+        if upstream_resp.status_code >= 400:
+            content_type = upstream_resp.headers.get("content-type", "application/json")
+            return Response(
+                content=upstream_resp.content,
+                status_code=upstream_resp.status_code,
+                media_type=content_type.split(";", 1)[0],
+            )
+
+        content_type = upstream_resp.headers.get("content-type", "application/json")
+        return Response(
+            content=upstream_resp.content,
+            status_code=upstream_resp.status_code,
+            media_type=content_type.split(";", 1)[0],
+        )
+
+    try:
+        client = httpx.AsyncClient(timeout=OPENROUTER_TIMEOUT)
+        req = client.build_request("POST", OPENROUTER_URL, headers=headers, json=payload)
+        upstream_resp = await client.send(req, stream=True)
+    except httpx.RequestError as exc:
         logger.warning("/v1/chat/completions upstream stream failed: %s", exc.__class__.__name__)
         raise HTTPException(status_code=502, detail="Upstream error") from exc
 

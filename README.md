@@ -114,3 +114,20 @@ docker compose up -d ai-gateway
      ```
      这样会直接以远端最新代码覆盖本地，避免手动逐段解决冲突（注意会丢本地未提交改动）。
   3. 再执行 `docker compose up -d --build` 重新部署。
+## /v1/models 上游透传验证
+```bash
+export TOKEN='替换成你的 GATEWAY_TOKEN'
+export UPSTREAM_KEY='替换成你的上游 Key（OPENROUTER_API_KEY / UPSTREAM_API_KEY / OPENAI_API_KEY）'
+
+# 网关：应返回与上游一致的 object=list, data=[...] 结构
+curl -sS http://127.0.0.1:8000/v1/models \
+  -H "X-API-Key: ${TOKEN}"
+
+# 验证模型数量（若上游有多个模型，应 > 1）
+curl -sS http://127.0.0.1:8000/v1/models \
+  -H "X-API-Key: ${TOKEN}" | python -c 'import json,sys; print(len(json.load(sys.stdin).get("data", [])))'
+
+# 直连上游对比响应形状
+curl -sS https://openrouter.ai/api/v1/models \
+  -H "Authorization: Bearer ${UPSTREAM_KEY}"
+```
