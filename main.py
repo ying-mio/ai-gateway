@@ -9,8 +9,6 @@ from typing import Any, Literal
 import httpx
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
-from fastapi.responses import StreamingResponse
-from starlette.background import BackgroundTask
 from pydantic import BaseModel, ConfigDict, Field
 
 load_dotenv()
@@ -61,21 +59,6 @@ def _resolve_upstream_api_key() -> str | None:
         if value:
             return value
     return None
-
-
-
-async def _aclose_upstream_response(resp: httpx.Response, client: httpx.AsyncClient) -> None:
-    await resp.aclose()
-    await client.aclose()
-
-
-def _upstream_chat_headers(api_key: str) -> dict[str, str]:
-    return {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": OPENROUTER_REFERER,
-        "X-Title": OPENROUTER_TITLE,
-    }
 
 app = FastAPI(title="AI Gateway")
 
@@ -320,8 +303,8 @@ async def chat_completions(request: Request):
     if not stream:
         try:
             async with httpx.AsyncClient(timeout=OPENROUTER_TIMEOUT) as client:
-                upstream_resp = await client.post(CHAT_COMPLETIONS_URL, headers=headers, json=payload)
-        except Exception as exc:  # noqa: BLE001
+                upstream_resp = await client.post(OPENROUTER_URL, headers=headers, json=payload)
+        except httpx.RequestError as exc:
             logger.warning("/v1/chat/completions upstream request failed: %s", exc.__class__.__name__)
             raise HTTPException(status_code=502, detail="Upstream error") from exc
 
@@ -340,14 +323,11 @@ async def chat_completions(request: Request):
             media_type=content_type.split(";", 1)[0],
         )
 
-    client: httpx.AsyncClient | None = None
     try:
         client = httpx.AsyncClient(timeout=OPENROUTER_TIMEOUT)
-        req = client.build_request("POST", CHAT_COMPLETIONS_URL, headers=headers, json=payload)
+        req = client.build_request("POST", OPENROUTER_URL, headers=headers, json=payload)
         upstream_resp = await client.send(req, stream=True)
-    except Exception as exc:  # noqa: BLE001
-        if client is not None:
-            await client.aclose()
+    except httpx.RequestError as exc:
         logger.warning("/v1/chat/completions upstream stream failed: %s", exc.__class__.__name__)
         raise HTTPException(status_code=502, detail="Upstream error") from exc
 
