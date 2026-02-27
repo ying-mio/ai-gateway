@@ -12,7 +12,6 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict
 from starlette.background import BackgroundTask
-from pydantic import BaseModel, ConfigDict, Field
 
 load_dotenv()
 
@@ -32,17 +31,12 @@ GATEWAY_TOKEN = os.getenv("GATEWAY_TOKEN", "").strip()
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "openai/gpt-4o-mini").strip()
 AVAILABLE_MODELS = _csv_env("AVAILABLE_MODELS") or [DEFAULT_MODEL]
 UPSTREAM_BASE_URL = os.getenv("UPSTREAM_BASE_URL", "https://openrouter.ai/api/v1").strip().rstrip("/")
-UPSTREAM_TIMEOUT = float(os.getenv("UPSTREAM_TIMEOUT", os.getenv("OPENROUTER_TIMEOUT", "60")))
-
-UPSTREAM_BASE_URL = os.getenv("UPSTREAM_BASE_URL", "https://openrouter.ai/api/v1").strip().rstrip("/")
 CHAT_COMPLETIONS_URL = os.getenv("UPSTREAM_CHAT_URL", os.getenv("OPENROUTER_URL", "")).strip() or f"{UPSTREAM_BASE_URL}/chat/completions"
 UPSTREAM_TIMEOUT = float(os.getenv("UPSTREAM_TIMEOUT", os.getenv("OPENROUTER_TIMEOUT", "60")))
-CHAT_COMPLETIONS_URL = os.getenv("UPSTREAM_CHAT_URL", os.getenv("OPENROUTER_URL", "")).strip()
-if not CHAT_COMPLETIONS_URL:
-    CHAT_COMPLETIONS_URL = f"{UPSTREAM_BASE_URL}/chat/completions"
-OPENROUTER_TIMEOUT = float(os.getenv("OPENROUTER_TIMEOUT", "60"))
+OPENROUTER_TIMEOUT = float(os.getenv("OPENROUTER_TIMEOUT", str(UPSTREAM_TIMEOUT)))
 OPENROUTER_REFERER = os.getenv("OPENROUTER_REFERER", "http://localhost")
 OPENROUTER_TITLE = os.getenv("OPENROUTER_TITLE", "ai-gateway")
+
 OPENROUTER_API_KEYS = _csv_env("OPENROUTER_API_KEYS")
 if not OPENROUTER_API_KEYS:
     one_key = os.getenv("OPENROUTER_API_KEY", "").strip()
@@ -57,16 +51,6 @@ if not GEMINI_API_KEYS:
 
 if not GATEWAY_TOKEN:
     raise RuntimeError("Missing GATEWAY_TOKEN in environment")
-
-
-def _resolve_upstream_api_key() -> str | None:
-    for key_name in ("OPENROUTER_API_KEY", "UPSTREAM_API_KEY", "OPENAI_API_KEY"):
-        value = os.getenv(key_name, "").strip()
-        if value:
-            return value
-    return None
-
-app = FastAPI(title="AI Gateway")
 
 
 class ChatMessage(BaseModel):
@@ -100,6 +84,9 @@ class ChatOut(BaseModel):
     duration_ms: float
     upstream_status: int
     provider: str
+
+
+app = FastAPI(title="AI Gateway")
 
 
 def _mask_detail(text: str, keys: list[str]) -> str:
@@ -172,14 +159,12 @@ def _extract_prompt(messages: list[ChatMessage]) -> str:
 
 async def _call_upstream(payload: OpenAIChatRequest, request_id: str) -> tuple[str, int, str]:
     model = payload.model or DEFAULT_MODEL
-    provider = PROVIDER
 
-    if provider == "openrouter":
+    if PROVIDER == "openrouter":
         api_key = _pick_key(OPENROUTER_API_KEYS, request_id) or _resolve_upstream_api_key()
         if not api_key:
             raise HTTPException(status_code=502, detail="Upstream openrouter not configured: missing API key")
 
-        headers = _upstream_chat_headers(api_key)
         body: dict[str, Any] = {"model": model, "messages": [m.model_dump() for m in payload.messages]}
         if payload.temperature is not None:
             body["temperature"] = payload.temperature
@@ -189,8 +174,6 @@ async def _call_upstream(payload: OpenAIChatRequest, request_id: str) -> tuple[s
         try:
             async with httpx.AsyncClient(timeout=OPENROUTER_TIMEOUT) as client:
                 resp = await client.post(CHAT_COMPLETIONS_URL, headers=_upstream_headers(api_key), json=body)
-        except Exception as exc:  # noqa: BLE001
-                resp = await client.post(CHAT_COMPLETIONS_URL, headers=headers, json=body)
         except httpx.RequestError as exc:
             raise HTTPException(status_code=502, detail=f"Upstream request failed: {exc.__class__.__name__}") from exc
 
@@ -206,12 +189,11 @@ async def _call_upstream(payload: OpenAIChatRequest, request_id: str) -> tuple[s
 
         return reply, resp.status_code, model
 
-    if provider == "gemini":
+    if PROVIDER == "gemini":
         prompt = _extract_prompt(payload.messages)
-        reply = f"[gemini-placeholder] {prompt}"
-        return reply, 200, model
+        return f"[gemini-placeholder] {prompt}", 200, model
 
-    raise HTTPException(status_code=502, detail=f"Unsupported provider: {provider}")
+    raise HTTPException(status_code=502, detail=f"Unsupported provider: {PROVIDER}")
 
 
 async def _process_chat(payload: OpenAIChatRequest, request: Request) -> dict[str, Any]:
@@ -270,9 +252,6 @@ async def list_models():
     if not upstream_key:
         raise HTTPException(status_code=502, detail="Upstream key is not configured")
 
-    try:
-        async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT) as client:
-            upstream_resp = await client.get(f"{UPSTREAM_BASE_URL}/models", headers={"Authorization": f"Bearer {upstream_key}"})
     models_url = f"{UPSTREAM_BASE_URL}/models"
     headers = {"Authorization": f"Bearer {upstream_key}"}
 
@@ -283,14 +262,11 @@ async def list_models():
         logger.warning("/v1/models upstream request failed: %s", exc.__class__.__name__)
         raise HTTPException(status_code=502, detail="Upstream error") from exc
 
+    content_type = upstream_resp.headers.get("content-type", "application/json")
+    media_type = content_type.split(";", 1)[0]
+
     if upstream_resp.status_code != 200:
-        content_type = upstream_resp.headers.get("content-type", "application/json")
-        return Response(content=upstream_resp.content, status_code=upstream_resp.status_code, media_type=content_type.split(";", 1)[0])
-        return Response(
-            content=upstream_resp.content,
-            status_code=upstream_resp.status_code,
-            media_type=content_type.split(";", 1)[0],
-        )
+        return Response(content=upstream_resp.content, status_code=upstream_resp.status_code, media_type=media_type)
 
     try:
         return upstream_resp.json()
@@ -331,44 +307,15 @@ async def chat_completions(request: Request):
         raise HTTPException(status_code=422, detail="Request body must be a JSON object")
 
     headers = _upstream_headers(api_key)
-
-    if not bool(payload.get("stream")):
-        try:
-            async with httpx.AsyncClient(timeout=OPENROUTER_TIMEOUT) as client:
-                upstream_resp = await client.post(CHAT_COMPLETIONS_URL, headers=headers, json=payload)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("/v1/chat/completions upstream request failed: %s", exc.__class__.__name__)
-            raise HTTPException(status_code=502, detail="Upstream error") from exc
-
-        content_type = upstream_resp.headers.get("content-type", "application/json")
-        return Response(content=upstream_resp.content, status_code=upstream_resp.status_code, media_type=content_type.split(";", 1)[0])
-
-    client: httpx.AsyncClient | None = None
-    try:
-        client = httpx.AsyncClient(timeout=OPENROUTER_TIMEOUT)
-        req = client.build_request("POST", CHAT_COMPLETIONS_URL, headers=headers, json=payload)
-        upstream_resp = await client.send(req, stream=True)
-    except Exception as exc:  # noqa: BLE001
-        if client is not None:
-            await client.aclose()
     stream = bool(payload.get("stream"))
-    headers = _upstream_chat_headers(api_key)
 
     if not stream:
         try:
             async with httpx.AsyncClient(timeout=OPENROUTER_TIMEOUT) as client:
-                upstream_resp = await client.post(OPENROUTER_URL, headers=headers, json=payload)
+                upstream_resp = await client.post(CHAT_COMPLETIONS_URL, headers=headers, json=payload)
         except httpx.RequestError as exc:
             logger.warning("/v1/chat/completions upstream request failed: %s", exc.__class__.__name__)
             raise HTTPException(status_code=502, detail="Upstream error") from exc
-
-        if upstream_resp.status_code >= 400:
-            content_type = upstream_resp.headers.get("content-type", "application/json")
-            return Response(
-                content=upstream_resp.content,
-                status_code=upstream_resp.status_code,
-                media_type=content_type.split(";", 1)[0],
-            )
 
         content_type = upstream_resp.headers.get("content-type", "application/json")
         return Response(
@@ -377,11 +324,14 @@ async def chat_completions(request: Request):
             media_type=content_type.split(";", 1)[0],
         )
 
+    client: httpx.AsyncClient | None = None
     try:
         client = httpx.AsyncClient(timeout=OPENROUTER_TIMEOUT)
-        req = client.build_request("POST", OPENROUTER_URL, headers=headers, json=payload)
+        req = client.build_request("POST", CHAT_COMPLETIONS_URL, headers=headers, json=payload)
         upstream_resp = await client.send(req, stream=True)
     except httpx.RequestError as exc:
+        if client is not None:
+            await client.aclose()
         logger.warning("/v1/chat/completions upstream stream failed: %s", exc.__class__.__name__)
         raise HTTPException(status_code=502, detail="Upstream error") from exc
 
