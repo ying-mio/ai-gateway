@@ -8,7 +8,9 @@ from typing import Any, Literal
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
+from fastapi.responses import StreamingResponse
+from starlette.background import BackgroundTask
 from pydantic import BaseModel, ConfigDict, Field
 
 load_dotenv()
@@ -28,6 +30,8 @@ PROVIDER = os.getenv("PROVIDER", "openrouter").strip().lower()
 GATEWAY_TOKEN = os.getenv("GATEWAY_TOKEN", "").strip()
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "openai/gpt-4o-mini").strip()
 AVAILABLE_MODELS = _csv_env("AVAILABLE_MODELS") or [DEFAULT_MODEL]
+UPSTREAM_BASE_URL = os.getenv("UPSTREAM_BASE_URL", "https://openrouter.ai/api/v1").strip().rstrip("/")
+UPSTREAM_TIMEOUT = float(os.getenv("UPSTREAM_TIMEOUT", os.getenv("OPENROUTER_TIMEOUT", "60")))
 
 OPENROUTER_URL = os.getenv("OPENROUTER_URL", "https://openrouter.ai/api/v1/chat/completions")
 OPENROUTER_TIMEOUT = float(os.getenv("OPENROUTER_TIMEOUT", "60"))
@@ -47,6 +51,29 @@ if not GEMINI_API_KEYS:
 
 if not GATEWAY_TOKEN:
     raise RuntimeError("Missing GATEWAY_TOKEN in environment")
+
+
+def _resolve_upstream_api_key() -> str | None:
+    for key_name in ("OPENROUTER_API_KEY", "UPSTREAM_API_KEY", "OPENAI_API_KEY"):
+        value = os.getenv(key_name, "").strip()
+        if value:
+            return value
+    return None
+
+
+
+async def _aclose_upstream_response(resp: httpx.Response, client: httpx.AsyncClient) -> None:
+    await resp.aclose()
+    await client.aclose()
+
+
+def _upstream_chat_headers(api_key: str) -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": OPENROUTER_REFERER,
+        "X-Title": OPENROUTER_TITLE,
+    }
 
 app = FastAPI(title="AI Gateway")
 
@@ -135,16 +162,11 @@ async def _call_upstream(payload: OpenAIChatRequest, request_id: str) -> tuple[s
     provider = PROVIDER
 
     if provider == "openrouter":
-        api_key = _pick_key(OPENROUTER_API_KEYS, request_id)
+        api_key = _pick_key(OPENROUTER_API_KEYS, request_id) or _resolve_upstream_api_key()
         if not api_key:
-            raise HTTPException(status_code=502, detail="Upstream openrouter not configured: missing OPENROUTER_API_KEY(S)")
+            raise HTTPException(status_code=502, detail="Upstream openrouter not configured: missing API key")
 
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": OPENROUTER_REFERER,
-            "X-Title": OPENROUTER_TITLE,
-        }
+        headers = _upstream_chat_headers(api_key)
         body: dict[str, Any] = {"model": model, "messages": [m.model_dump() for m in payload.messages]}
         if payload.temperature is not None:
             body["temperature"] = payload.temperature
@@ -229,21 +251,34 @@ def health():
 
 
 @app.get("/v1/models", dependencies=[Depends(_check_gateway_key)])
-def list_models():
-    now = int(time.time())
-    return {
-        "object": "list",
-        "data": [
-            {
-                "id": model,
-                "object": "model",
-                "created": now,
-                "owned_by": PROVIDER,
-                "type": "chat.completions",
-            }
-            for model in AVAILABLE_MODELS
-        ],
-    }
+async def list_models():
+    upstream_key = _resolve_upstream_api_key()
+    if not upstream_key:
+        raise HTTPException(status_code=502, detail="Upstream key is not configured")
+
+    models_url = f"{UPSTREAM_BASE_URL}/models"
+    headers = {"Authorization": f"Bearer {upstream_key}"}
+
+    try:
+        async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT) as client:
+            upstream_resp = await client.get(models_url, headers=headers)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("/v1/models upstream request failed: %s", exc.__class__.__name__)
+        raise HTTPException(status_code=502, detail="Upstream error") from exc
+
+    if upstream_resp.status_code != 200:
+        content_type = upstream_resp.headers.get("content-type", "application/json")
+        return Response(
+            content=upstream_resp.content,
+            status_code=upstream_resp.status_code,
+            media_type=content_type.split(";", 1)[0],
+        )
+
+    try:
+        return upstream_resp.json()
+    except json.JSONDecodeError as exc:
+        logger.warning("/v1/models upstream returned non-JSON body")
+        raise HTTPException(status_code=502, detail="Upstream error") from exc
 
 
 @app.post("/chat", response_model=ChatOut, dependencies=[Depends(_check_gateway_key)])
@@ -263,19 +298,65 @@ async def chat(payload: ChatIn, request: Request):
 
 
 @app.post("/v1/chat/completions", dependencies=[Depends(_check_gateway_key)])
-async def chat_completions(payload: OpenAIChatRequest, request: Request):
-    result = await _process_chat(payload, request)
-    return {
-        "id": f"chatcmpl-{result['request_id']}",
-        "object": "chat.completion",
-        "created": int(time.time()),
-        "model": result["model"],
-        "choices": [
-            {
-                "index": 0,
-                "message": {"role": "assistant", "content": result["reply"]},
-                "finish_reason": "stop",
-            }
-        ],
-        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-    }
+async def chat_completions(request: Request):
+    request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
+    api_key = _pick_key(OPENROUTER_API_KEYS, request_id) or _resolve_upstream_api_key()
+    if not api_key:
+        raise HTTPException(status_code=502, detail="Upstream openrouter not configured: missing API key")
+
+    try:
+        payload = await request.json()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from exc
+
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=422, detail="Request body must be a JSON object")
+
+    stream = bool(payload.get("stream"))
+    headers = _upstream_chat_headers(api_key)
+
+    if not stream:
+        try:
+            async with httpx.AsyncClient(timeout=OPENROUTER_TIMEOUT) as client:
+                upstream_resp = await client.post(OPENROUTER_URL, headers=headers, json=payload)
+        except httpx.RequestError as exc:
+            logger.warning("/v1/chat/completions upstream request failed: %s", exc.__class__.__name__)
+            raise HTTPException(status_code=502, detail="Upstream error") from exc
+
+        if upstream_resp.status_code >= 400:
+            content_type = upstream_resp.headers.get("content-type", "application/json")
+            return Response(
+                content=upstream_resp.content,
+                status_code=upstream_resp.status_code,
+                media_type=content_type.split(";", 1)[0],
+            )
+
+        content_type = upstream_resp.headers.get("content-type", "application/json")
+        return Response(
+            content=upstream_resp.content,
+            status_code=upstream_resp.status_code,
+            media_type=content_type.split(";", 1)[0],
+        )
+
+    try:
+        client = httpx.AsyncClient(timeout=OPENROUTER_TIMEOUT)
+        req = client.build_request("POST", OPENROUTER_URL, headers=headers, json=payload)
+        upstream_resp = await client.send(req, stream=True)
+    except httpx.RequestError as exc:
+        logger.warning("/v1/chat/completions upstream stream failed: %s", exc.__class__.__name__)
+        raise HTTPException(status_code=502, detail="Upstream error") from exc
+
+    if upstream_resp.status_code >= 400:
+        body = await upstream_resp.aread()
+        await upstream_resp.aclose()
+        await client.aclose()
+        content_type = upstream_resp.headers.get("content-type", "application/json")
+        return Response(content=body, status_code=upstream_resp.status_code, media_type=content_type.split(";", 1)[0])
+
+    content_type = upstream_resp.headers.get("content-type", "text/event-stream")
+    return StreamingResponse(
+        upstream_resp.aiter_raw(),
+        status_code=upstream_resp.status_code,
+        media_type=content_type.split(";", 1)[0],
+        background=BackgroundTask(_aclose_upstream_response, upstream_resp, client),
+    )

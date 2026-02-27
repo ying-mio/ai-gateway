@@ -9,6 +9,7 @@ distlib==0.4.0
 fastapi==0.133.0
 filelock==3.24.3
 h11==0.16.0
+httpx==0.28.1
 idna==3.11
 platformdirs==4.9.2
 pydantic==2.12.5
