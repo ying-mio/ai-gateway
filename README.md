@@ -83,3 +83,22 @@ curl -i "${BASE_URL}/v1/chat/completions" \
 2. 将新 key 写入 `.env`，重启容器生效。
 3. 确认仓库中不再包含 `.env`、私钥文件（已在 `.gitignore` 忽略）。
 4. 如需进一步清理历史，可后续安排历史重写；生产上先“撤销+轮换”优先级更高。
+
+
+## /v1/models 上游透传验证
+```bash
+export TOKEN='替换成你的 GATEWAY_TOKEN'
+export UPSTREAM_KEY='替换成你的上游 Key（OPENROUTER_API_KEY / UPSTREAM_API_KEY / OPENAI_API_KEY）'
+
+# 网关：应返回与上游一致的 object=list, data=[...] 结构
+curl -sS http://127.0.0.1:8000/v1/models \
+  -H "X-API-Key: ${TOKEN}"
+
+# 验证模型数量（若上游有多个模型，应 > 1）
+curl -sS http://127.0.0.1:8000/v1/models \
+  -H "X-API-Key: ${TOKEN}" | python -c 'import json,sys; print(len(json.load(sys.stdin).get("data", [])))'
+
+# 直连上游对比响应形状
+curl -sS https://openrouter.ai/api/v1/models \
+  -H "Authorization: Bearer ${UPSTREAM_KEY}"
+```
