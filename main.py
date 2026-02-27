@@ -8,7 +8,7 @@ from typing import Any, Literal
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from pydantic import BaseModel, ConfigDict, Field
 
 load_dotenv()
@@ -28,6 +28,8 @@ PROVIDER = os.getenv("PROVIDER", "openrouter").strip().lower()
 GATEWAY_TOKEN = os.getenv("GATEWAY_TOKEN", "").strip()
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "openai/gpt-4o-mini").strip()
 AVAILABLE_MODELS = _csv_env("AVAILABLE_MODELS") or [DEFAULT_MODEL]
+UPSTREAM_BASE_URL = os.getenv("UPSTREAM_BASE_URL", "https://openrouter.ai/api/v1").strip().rstrip("/")
+UPSTREAM_TIMEOUT = float(os.getenv("UPSTREAM_TIMEOUT", os.getenv("OPENROUTER_TIMEOUT", "60")))
 
 OPENROUTER_URL = os.getenv("OPENROUTER_URL", "https://openrouter.ai/api/v1/chat/completions")
 OPENROUTER_TIMEOUT = float(os.getenv("OPENROUTER_TIMEOUT", "60"))
@@ -47,6 +49,14 @@ if not GEMINI_API_KEYS:
 
 if not GATEWAY_TOKEN:
     raise RuntimeError("Missing GATEWAY_TOKEN in environment")
+
+
+def _resolve_upstream_api_key() -> str | None:
+    for key_name in ("OPENROUTER_API_KEY", "UPSTREAM_API_KEY", "OPENAI_API_KEY"):
+        value = os.getenv(key_name, "").strip()
+        if value:
+            return value
+    return None
 
 app = FastAPI(title="AI Gateway")
 
@@ -229,21 +239,34 @@ def health():
 
 
 @app.get("/v1/models", dependencies=[Depends(_check_gateway_key)])
-def list_models():
-    now = int(time.time())
-    return {
-        "object": "list",
-        "data": [
-            {
-                "id": model,
-                "object": "model",
-                "created": now,
-                "owned_by": PROVIDER,
-                "type": "chat.completions",
-            }
-            for model in AVAILABLE_MODELS
-        ],
-    }
+async def list_models():
+    upstream_key = _resolve_upstream_api_key()
+    if not upstream_key:
+        raise HTTPException(status_code=502, detail="Upstream key is not configured")
+
+    models_url = f"{UPSTREAM_BASE_URL}/models"
+    headers = {"Authorization": f"Bearer {upstream_key}"}
+
+    try:
+        async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT) as client:
+            upstream_resp = await client.get(models_url, headers=headers)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("/v1/models upstream request failed: %s", exc.__class__.__name__)
+        raise HTTPException(status_code=502, detail="Upstream error") from exc
+
+    if upstream_resp.status_code != 200:
+        content_type = upstream_resp.headers.get("content-type", "application/json")
+        return Response(
+            content=upstream_resp.content,
+            status_code=upstream_resp.status_code,
+            media_type=content_type.split(";", 1)[0],
+        )
+
+    try:
+        return upstream_resp.json()
+    except json.JSONDecodeError as exc:
+        logger.warning("/v1/models upstream returned non-JSON body")
+        raise HTTPException(status_code=502, detail="Upstream error") from exc
 
 
 @app.post("/chat", response_model=ChatOut, dependencies=[Depends(_check_gateway_key)])
