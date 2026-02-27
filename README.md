@@ -1,60 +1,85 @@
 # AI Gateway
 
-最小可用 FastAPI 网关，当前提供：
-- `GET /`
-- `GET /health`
-- `POST /chat`（转发 OpenRouter）
+一个自用 OpenAI 兼容网关，适合部署在 VPS（Docker Compose + 反向代理 + HTTPS）。
 
-## 安装依赖（Windows PowerShell）
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-pip install -r requirements.txt
-```
+## 已实现接口
+- `GET /`
+- `GET /health`（不鉴权，方便探活）
+- `GET /v1/models`（鉴权）
+- `POST /v1/chat/completions`（OpenAI ChatCompletions 兼容，鉴权）
+- `POST /chat`（简化接口，鉴权；内部复用同一核心逻辑）
+
+## 鉴权
+支持以下任意一种请求头：
+- `X-API-Key: <GATEWAY_TOKEN>`
+- `Authorization: Bearer <GATEWAY_TOKEN>`
+
+鉴权失败返回 `401` JSON，不会返回 500。
 
 ## 环境变量
-复制 `.env.example` 后填写 `.env`：
+复制 `.env.example` 到 `.env` 后填写：
 
-```env
-GATEWAY_TOKEN=your_gateway_token
-OPENROUTER_API_KEY=your_openrouter_key
-DEFAULT_MODEL=openai/gpt-4o-mini
-OPENROUTER_URL=https://openrouter.ai/api/v1/chat/completions
-OPENROUTER_TIMEOUT=60
-OPENROUTER_REFERER=http://localhost
-OPENROUTER_TITLE=ai-gateway-minimal
+```bash
+cp .env.example .env
 ```
 
-## 运行（Windows PowerShell）
-```powershell
-python -m uvicorn main:app --host 0.0.0.0 --port 8000
+必须至少填写：
+- `GATEWAY_TOKEN`
+- `PROVIDER`（`openrouter` 或 `gemini`）
+- 对应 provider 的 key（如 `OPENROUTER_API_KEY`）
+
+> 支持多 key：例如 `OPENROUTER_API_KEYS=key1,key2`，服务会按 request_id 做稳定轮询。
+
+## Docker 部署（VPS）
+```bash
+docker compose up -d --build
+docker compose ps
+docker compose logs --tail=80 ai-gateway
 ```
 
+## 最短验证命令（本机 127.0.0.1）
+```bash
+export TOKEN='替换成你的 GATEWAY_TOKEN'
 
-## Windows PowerShell 一键测试命令
-```powershell
-# 测试 /health
-Invoke-RestMethod -Method Get -Uri "http://127.0.0.1:8000/health"
+curl -i http://127.0.0.1:8000/health
 
-# 测试 /chat
-$headers = @{ "Content-Type" = "application/json"; "X-API-Key" = "your_gateway_token" }; $body = '{"message":"你好"}'; Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8000/chat" -Headers $headers -Body $body
+curl -i http://127.0.0.1:8000/v1/models \
+  -H "X-API-Key: ${TOKEN}"
+
+curl -i http://127.0.0.1:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: ${TOKEN}" \
+  -d '{"model":"openai/gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}'
+
+curl -i http://127.0.0.1:8000/chat \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: ${TOKEN}" \
+  -d '{"message":"你好"}'
 ```
 
-## 调用示例（必须带鉴权头）
-```powershell
-$headers = @{
-  "Content-Type" = "application/json"
-  "X-API-Key" = "your_gateway_token"
-}
-$body = '{"message":"你好"}'
-Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8000/chat" -Headers $headers -Body $body
+## 最短验证命令（线上域名 + HTTPS）
+```bash
+export TOKEN='替换成你的 GATEWAY_TOKEN'
+export BASE_URL='https://your-domain.example'
 
-# 可选字段示例（model / system / temperature / max_tokens）
-$body2 = '{"message":"你好","model":"openai/gpt-4o-mini","system":"你是简洁助手","temperature":0.7,"max_tokens":256}'
-Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8000/chat" -Headers $headers -Body $body2
+curl -i "${BASE_URL}/health"
+
+curl -i "${BASE_URL}/v1/models" \
+  -H "Authorization: Bearer ${TOKEN}"
+
+curl -i "${BASE_URL}/v1/chat/completions" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer ${TOKEN}" \
+  -d '{"model":"openai/gpt-4o-mini","messages":[{"role":"user","content":"hello"}]}'
 ```
 
-未提供或提供错误 `X-API-Key` 时，`/chat` 返回 `401 Unauthorized`。
+## 反向代理要点
+- 反代到容器服务 `127.0.0.1:8000`
+- 开启 HTTPS（Nginx/Caddy/Traefik 均可）
+- 保留 `Authorization` 与 `X-API-Key` 请求头
 
-`/chat` 响应包含：`reply`、`model`、`request_id`、`duration_ms`、`upstream_status`。
+## 安全建议（若历史曾泄露密钥）
+1. 立刻在上游平台撤销并轮换泄露 key。
+2. 将新 key 写入 `.env`，重启容器生效。
+3. 确认仓库中不再包含 `.env`、私钥文件（已在 `.gitignore` 忽略）。
+4. 如需进一步清理历史，可后续安排历史重写；生产上先“撤销+轮换”优先级更高。
