@@ -6,11 +6,10 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Literal
 
-import requests
+import httpx
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 load_dotenv()
 
@@ -19,19 +18,35 @@ logger = logging.getLogger("ai_gateway")
 
 PROJECT_NAME = "ai-gateway"
 
+
+def _csv_env(name: str) -> list[str]:
+    raw = os.getenv(name, "")
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
+PROVIDER = os.getenv("PROVIDER", "openrouter").strip().lower()
 GATEWAY_TOKEN = os.getenv("GATEWAY_TOKEN", "").strip()
-UPSTREAM_BASE_URL = os.getenv("UPSTREAM_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
-UPSTREAM_API_KEY = os.getenv("UPSTREAM_API_KEY", "").strip()
-UPSTREAM_TIMEOUT = float(os.getenv("UPSTREAM_TIMEOUT", "60"))
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "openai/gpt-4o-mini").strip()
-UPSTREAM_PROVIDER = os.getenv("UPSTREAM_PROVIDER", "openrouter").strip().lower()
-OPENROUTER_REFERER = os.getenv("OPENROUTER_REFERER", "https://foxrelay.xyz")
+AVAILABLE_MODELS = _csv_env("AVAILABLE_MODELS") or [DEFAULT_MODEL]
+
+OPENROUTER_URL = os.getenv("OPENROUTER_URL", "https://openrouter.ai/api/v1/chat/completions")
+OPENROUTER_TIMEOUT = float(os.getenv("OPENROUTER_TIMEOUT", "60"))
+OPENROUTER_REFERER = os.getenv("OPENROUTER_REFERER", "http://localhost")
 OPENROUTER_TITLE = os.getenv("OPENROUTER_TITLE", "ai-gateway")
+OPENROUTER_API_KEYS = _csv_env("OPENROUTER_API_KEYS")
+if not OPENROUTER_API_KEYS:
+    one_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+    if one_key:
+        OPENROUTER_API_KEYS = [one_key]
+
+GEMINI_API_KEYS = _csv_env("GEMINI_API_KEYS")
+if not GEMINI_API_KEYS:
+    one_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if one_key:
+        GEMINI_API_KEYS = [one_key]
 
 if not GATEWAY_TOKEN:
     raise RuntimeError("Missing GATEWAY_TOKEN in environment")
-if not UPSTREAM_API_KEY:
-    raise RuntimeError("Missing UPSTREAM_API_KEY in environment")
 
 app = FastAPI(title="AI Gateway")
 
@@ -42,13 +57,12 @@ class ChatMessage(BaseModel):
 
 
 class OpenAIChatRequest(BaseModel):
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="ignore")
 
     model: str | None = None
     messages: list[ChatMessage]
     temperature: float | None = None
     max_tokens: int | None = None
-    stream: bool = False
 
 
 class ChatIn(BaseModel):
@@ -67,18 +81,22 @@ class ChatOut(BaseModel):
     request_id: str
     duration_ms: float
     upstream_status: int
+    provider: str
 
 
-def _auth_headers() -> dict[str, str]:
-    headers = {"Authorization": f"Bearer {UPSTREAM_API_KEY}", "Content-Type": "application/json"}
-    if UPSTREAM_PROVIDER == "openrouter":
-        headers["HTTP-Referer"] = OPENROUTER_REFERER
-        headers["X-Title"] = OPENROUTER_TITLE
-    return headers
+def _mask_detail(text: str, keys: list[str]) -> str:
+    masked = text
+    for key in keys:
+        if key:
+            masked = masked.replace(key, "***")
+    return masked
 
 
-def _short(text: str, limit: int = 500) -> str:
-    return text[:limit].replace("\n", " ")
+def _pick_key(keys: list[str], request_id: str) -> str | None:
+    if not keys:
+        return None
+    idx = int(uuid.UUID(request_id)) % len(keys)
+    return keys[idx]
 
 
 def _check_gateway_key(
@@ -94,99 +112,102 @@ def _check_gateway_key(
 
 def _extract_prompt(messages: list[ChatMessage]) -> str:
     for msg in reversed(messages):
-        if msg.role == "user" and isinstance(msg.content, str) and msg.content.strip():
-            return msg.content
-    raise HTTPException(status_code=422, detail="messages must contain at least one user message")
+        if msg.role != "user":
+            continue
+        content = msg.content
+        if isinstance(content, str) and content.strip():
+            return content
+        if isinstance(content, list):
+            text_parts: list[str] = []
+            for item in content:
+                if isinstance(item, dict) and item.get("type") in {"text", None}:
+                    part = item.get("text")
+                    if isinstance(part, str):
+                        text_parts.append(part)
+            merged = "\n".join(p for p in text_parts if p.strip())
+            if merged:
+                return merged
+    raise HTTPException(status_code=422, detail="messages must contain at least one user message with text content")
 
 
-def _chat_non_stream(payload: OpenAIChatRequest, request_id: str) -> tuple[dict[str, Any], int]:
-    body = payload.model_dump(mode="json", exclude_none=True)
-    body["model"] = body.get("model") or DEFAULT_MODEL
-    url = f"{UPSTREAM_BASE_URL}/chat/completions"
+async def _call_upstream(payload: OpenAIChatRequest, request_id: str) -> tuple[str, int, str]:
+    model = payload.model or DEFAULT_MODEL
+    provider = PROVIDER
 
-    try:
-        resp = requests.post(url, headers=_auth_headers(), json=body, timeout=UPSTREAM_TIMEOUT)
-    except requests.RequestException as exc:
-        raise HTTPException(status_code=502, detail=f"Upstream request failed: {exc.__class__.__name__}") from exc
+    if provider == "openrouter":
+        api_key = _pick_key(OPENROUTER_API_KEYS, request_id)
+        if not api_key:
+            raise HTTPException(status_code=502, detail="Upstream openrouter not configured: missing OPENROUTER_API_KEY(S)")
 
-    if resp.status_code >= 400:
-        summary = _short(resp.text)
-        logger.error("request_id=%s upstream_status=%s upstream_body=%s", request_id, resp.status_code, summary)
-        raise HTTPException(status_code=502, detail=f"Upstream error {resp.status_code}: {summary}")
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": OPENROUTER_REFERER,
+            "X-Title": OPENROUTER_TITLE,
+        }
+        body: dict[str, Any] = {"model": model, "messages": [m.model_dump() for m in payload.messages]}
+        if payload.temperature is not None:
+            body["temperature"] = payload.temperature
+        if payload.max_tokens is not None:
+            body["max_tokens"] = payload.max_tokens
 
-    try:
-        data = resp.json()
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail="Upstream returned non-JSON response") from exc
-
-    if "choices" not in data:
-        raise HTTPException(status_code=502, detail="Upstream response missing choices")
-
-    return data, resp.status_code
-
-
-async def _chat_stream(payload: OpenAIChatRequest, request: Request, request_id: str):
-    body = payload.model_dump(mode="json", exclude_none=True)
-    body["model"] = body.get("model") or DEFAULT_MODEL
-    body["stream"] = True
-    url = f"{UPSTREAM_BASE_URL}/chat/completions"
-
-    def event_generator():
-        upstream_status = 0
-        start = time.perf_counter()
         try:
-            with requests.post(url, headers=_auth_headers(), json=body, timeout=UPSTREAM_TIMEOUT, stream=True) as resp:
-                upstream_status = resp.status_code
-                if resp.status_code >= 400:
-                    summary = _short(resp.text)
-                    logger.error("request_id=%s upstream_status=%s upstream_body=%s", request_id, resp.status_code, summary)
-                    err = {"error": {"message": f"Upstream error {resp.status_code}: {summary}", "type": "upstream_error"}}
-                    yield f"data: {json.dumps(err, ensure_ascii=False)}\n\n"
-                    yield "data: [DONE]\n\n"
-                    return
-                for line in resp.iter_lines(decode_unicode=True):
-                    if line is None:
-                        continue
-                    if line:
-                        yield f"{line}\n"
-                    else:
-                        yield "\n"
-        except requests.RequestException as exc:
-            err = {"error": {"message": f"Upstream request failed: {exc.__class__.__name__}", "type": "upstream_error"}}
-            yield f"data: {json.dumps(err, ensure_ascii=False)}\n\n"
-            yield "data: [DONE]\n\n"
-        finally:
-            duration_ms = round((time.perf_counter() - start) * 1000, 2)
-            logger.info(
-                "request_id=%s path=%s duration_ms=%s upstream_status=%s model=%s stream=true",
-                request_id,
-                request.url.path,
-                duration_ms,
-                upstream_status,
-                body.get("model"),
-            )
+            async with httpx.AsyncClient(timeout=OPENROUTER_TIMEOUT) as client:
+                resp = await client.post(OPENROUTER_URL, headers=headers, json=body)
+        except httpx.RequestError as exc:
+            raise HTTPException(status_code=502, detail=f"Upstream request failed: {exc.__class__.__name__}") from exc
 
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+        if resp.status_code >= 400:
+            detail = _mask_detail(resp.text[:500], OPENROUTER_API_KEYS)
+            raise HTTPException(status_code=502, detail=f"Upstream openrouter error {resp.status_code}: {detail}")
+
+        try:
+            data = resp.json()
+            reply = data["choices"][0]["message"]["content"]
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=502, detail="Upstream openrouter returned invalid response format") from exc
+
+        return reply, resp.status_code, model
+
+    if provider == "gemini":
+        # 占位实现：先保证接口与可扩展结构，后续可接 Gemini SDK/API。
+        prompt = _extract_prompt(payload.messages)
+        reply = f"[gemini-placeholder] {prompt}"
+        return reply, 200, model
+
+    raise HTTPException(status_code=502, detail=f"Unsupported provider: {provider}")
 
 
-def _process_chat(payload: OpenAIChatRequest, request: Request) -> tuple[dict[str, Any], int, float]:
-    request_id = request.state.request_id
+async def _process_chat(payload: OpenAIChatRequest, request: Request) -> dict[str, Any]:
+    request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
     start = time.perf_counter()
     prompt = _extract_prompt(payload.messages)
+    upstream_status = 0
+    model = payload.model or DEFAULT_MODEL
 
-    data, upstream_status = _chat_non_stream(payload, request_id)
+    try:
+        reply, upstream_status, model = await _call_upstream(payload, request_id)
+    finally:
+        duration_ms = round((time.perf_counter() - start) * 1000, 2)
+        logger.info(
+            "request_id=%s path=%s duration_ms=%s provider=%s upstream_status=%s model=%s prompt_len=%s",
+            request_id,
+            request.url.path,
+            duration_ms,
+            PROVIDER,
+            upstream_status,
+            model,
+            len(prompt),
+        )
 
-    duration_ms = round((time.perf_counter() - start) * 1000, 2)
-    logger.info(
-        "request_id=%s path=%s duration_ms=%s upstream_status=%s model=%s prompt_len=%s stream=false",
-        request_id,
-        request.url.path,
-        duration_ms,
-        upstream_status,
-        data.get("model", payload.model or DEFAULT_MODEL),
-        len(prompt),
-    )
-    return data, upstream_status, duration_ms
+    return {
+        "request_id": request_id,
+        "reply": reply,
+        "model": model,
+        "duration_ms": duration_ms,
+        "upstream_status": upstream_status,
+        "provider": PROVIDER,
+    }
 
 
 @app.middleware("http")
@@ -199,7 +220,7 @@ async def request_context(request: Request, call_next):
 
 @app.get("/")
 def root():
-    return {"project": PROJECT_NAME, "time": datetime.now(timezone.utc).isoformat(), "upstream": UPSTREAM_BASE_URL}
+    return {"project": PROJECT_NAME, "time": datetime.now(timezone.utc).isoformat(), "provider": PROVIDER}
 
 
 @app.get("/health")
@@ -208,36 +229,21 @@ def health():
 
 
 @app.get("/v1/models", dependencies=[Depends(_check_gateway_key)])
-async def list_models(request: Request):
-    url = f"{UPSTREAM_BASE_URL}/models"
-    request_id = request.state.request_id
-    try:
-        resp = requests.get(url, headers=_auth_headers(), timeout=UPSTREAM_TIMEOUT)
-    except requests.RequestException as exc:
-        raise HTTPException(status_code=502, detail=f"Upstream request failed: {exc.__class__.__name__}") from exc
-
-    if resp.status_code >= 400:
-        summary = _short(resp.text)
-        logger.error("request_id=%s upstream_status=%s upstream_body=%s", request_id, resp.status_code, summary)
-        raise HTTPException(status_code=502, detail=f"Upstream error {resp.status_code}: {summary}")
-
-    payload = resp.json()
-    rows = payload.get("data", []) if isinstance(payload, dict) else []
+def list_models():
     now = int(time.time())
-    normalized = []
-    for item in rows:
-        if not isinstance(item, dict) or not item.get("id"):
-            continue
-        normalized.append(
+    return {
+        "object": "list",
+        "data": [
             {
-                "id": item["id"],
+                "id": model,
                 "object": "model",
-                "created": item.get("created", now),
-                "owned_by": item.get("owned_by") or item.get("name") or "upstream",
+                "created": now,
+                "owned_by": PROVIDER,
+                "type": "chat.completions",
             }
-        )
-
-    return {"object": "list", "data": normalized}
+            for model in AVAILABLE_MODELS
+        ],
+    }
 
 
 @app.post("/chat", response_model=ChatOut, dependencies=[Depends(_check_gateway_key)])
@@ -246,37 +252,30 @@ async def chat(payload: ChatIn, request: Request):
     if payload.system:
         messages.append(ChatMessage(role="system", content=payload.system))
     messages.append(ChatMessage(role="user", content=payload.message))
-
     normalized = OpenAIChatRequest(
         model=payload.model,
         messages=messages,
         temperature=payload.temperature,
         max_tokens=payload.max_tokens,
-        stream=False,
     )
-    data, upstream_status, duration_ms = _process_chat(normalized, request)
-    reply = data["choices"][0]["message"]["content"]
-
-    return ChatOut(
-        reply=reply,
-        model=data.get("model", payload.model or DEFAULT_MODEL),
-        request_id=request.state.request_id,
-        duration_ms=duration_ms,
-        upstream_status=upstream_status,
-    )
+    result = await _process_chat(normalized, request)
+    return ChatOut(**result)
 
 
 @app.post("/v1/chat/completions", dependencies=[Depends(_check_gateway_key)])
 async def chat_completions(payload: OpenAIChatRequest, request: Request):
-    if payload.stream:
-        return await _chat_stream(payload, request, request.state.request_id)
-
-    data, _, _ = _process_chat(payload, request)
+    result = await _process_chat(payload, request)
     return {
-        "id": data.get("id", f"chatcmpl-{request.state.request_id}"),
-        "object": data.get("object", "chat.completion"),
-        "created": data.get("created", int(time.time())),
-        "model": data.get("model", payload.model or DEFAULT_MODEL),
-        "choices": data.get("choices", []),
-        "usage": data.get("usage", {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}),
+        "id": f"chatcmpl-{result['request_id']}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": result["model"],
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": result["reply"]},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
     }
