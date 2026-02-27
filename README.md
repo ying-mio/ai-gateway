@@ -83,3 +83,34 @@ curl -i "${BASE_URL}/v1/chat/completions" \
 2. 将新 key 写入 `.env`，重启容器生效。
 3. 确认仓库中不再包含 `.env`、私钥文件（已在 `.gitignore` 忽略）。
 4. 如需进一步清理历史，可后续安排历史重写；生产上先“撤销+轮换”优先级更高。
+
+
+## 常见问题排查（Internal Server Error）
+如果前端发消息返回 500，请按顺序检查：
+
+```bash
+# 1) 先看容器日志（最关键）
+docker compose logs -f --tail=200 ai-gateway
+
+# 2) 确认 httpx 已安装（镜像更新后需要重建）
+docker compose build --no-cache ai-gateway
+
+docker compose up -d ai-gateway
+
+# 3) 确认网关与上游配置
+# 必填：GATEWAY_TOKEN + 至少一个上游 key
+# 可选：UPSTREAM_BASE_URL（默认 https://openrouter.ai/api/v1）
+# 可选：UPSTREAM_CHAT_URL（默认 ${UPSTREAM_BASE_URL}/chat/completions）
+```
+
+## 小白建议：如何减少 PR 冲突
+- 不建议“默认 Accept incoming change”。
+- 最稳妥流程：
+  1. 在 GitHub 合并 PR 时选择 **Rebase and merge**（历史更线性，冲突更少）。
+  2. 服务器上执行：
+     ```bash
+     git fetch origin
+     git reset --hard origin/<你的分支名>
+     ```
+     这样会直接以远端最新代码覆盖本地，避免手动逐段解决冲突（注意会丢本地未提交改动）。
+  3. 再执行 `docker compose up -d --build` 重新部署。
