@@ -26,8 +26,8 @@ def _csv_env(name: str) -> list[str]:
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
-PROVIDER = os.getenv("PROVIDER", "openrouter").strip().lower()
-GATEWAY_TOKEN = os.getenv("GATEWAY_TOKEN", "").strip()
+LEGACY_PROVIDER = os.getenv("PROVIDER", "openrouter").strip().lower()
+LEGACY_GATEWAY_TOKEN = os.getenv("GATEWAY_TOKEN", "").strip()
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "openai/gpt-4o-mini").strip()
 AVAILABLE_MODELS = _csv_env("AVAILABLE_MODELS") or [DEFAULT_MODEL]
 UPSTREAM_BASE_URL = os.getenv("UPSTREAM_BASE_URL", "https://openrouter.ai/api/v1").strip().rstrip("/")
@@ -49,8 +49,133 @@ if not GEMINI_API_KEYS:
     if one_key:
         GEMINI_API_KEYS = [one_key]
 
-if not GATEWAY_TOKEN:
-    raise RuntimeError("Missing GATEWAY_TOKEN in environment")
+
+class RouteConfig(BaseModel):
+    token: str
+    provider: str = "openrouter"
+    default_model: str = DEFAULT_MODEL
+    available_models: list[str] = [DEFAULT_MODEL]
+    base_url: str = "https://openrouter.ai/api/v1"
+    chat_url: str = "https://openrouter.ai/api/v1/chat/completions"
+    models_url: str = "https://openrouter.ai/api/v1/models"
+    timeout: float = UPSTREAM_TIMEOUT
+    api_keys: list[str] = []
+    extra_headers: dict[str, str] = {}
+
+
+def _resolve_upstream_api_key() -> str | None:
+    for key_name in ("OPENROUTER_API_KEY", "UPSTREAM_API_KEY", "OPENAI_API_KEY"):
+        value = os.getenv(key_name, "").strip()
+        if value:
+            return value
+    return None
+
+
+def _build_legacy_route() -> RouteConfig | None:
+    if not LEGACY_GATEWAY_TOKEN:
+        return None
+
+    keys = OPENROUTER_API_KEYS
+    if LEGACY_PROVIDER == "gemini":
+        keys = GEMINI_API_KEYS
+
+    fallback_key = _resolve_upstream_api_key()
+    if fallback_key and fallback_key not in keys:
+        keys = [*keys, fallback_key]
+
+    extra_headers: dict[str, str] = {}
+    if LEGACY_PROVIDER == "openrouter":
+        extra_headers = {
+            "HTTP-Referer": OPENROUTER_REFERER,
+            "X-Title": OPENROUTER_TITLE,
+        }
+
+    return RouteConfig(
+        token=LEGACY_GATEWAY_TOKEN,
+        provider=LEGACY_PROVIDER,
+        default_model=DEFAULT_MODEL,
+        available_models=AVAILABLE_MODELS,
+        base_url=UPSTREAM_BASE_URL,
+        chat_url=CHAT_COMPLETIONS_URL,
+        models_url=f"{UPSTREAM_BASE_URL}/models",
+        timeout=OPENROUTER_TIMEOUT if LEGACY_PROVIDER == "openrouter" else UPSTREAM_TIMEOUT,
+        api_keys=keys,
+        extra_headers=extra_headers,
+    )
+
+
+def _parse_gateway_routes() -> dict[str, RouteConfig]:
+    raw = os.getenv("GATEWAY_ROUTES", "").strip()
+    parsed_routes: list[dict[str, Any]] = []
+
+    if raw:
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("Invalid GATEWAY_ROUTES JSON") from exc
+
+        if isinstance(data, dict):
+            parsed_routes = list(data.values())
+        elif isinstance(data, list):
+            parsed_routes = data
+        else:
+            raise RuntimeError("GATEWAY_ROUTES must be a JSON list or object")
+
+    routes: dict[str, RouteConfig] = {}
+
+    for item in parsed_routes:
+        if not isinstance(item, dict):
+            continue
+
+        token = str(item.get("token", "")).strip()
+        if not token:
+            continue
+
+        provider = str(item.get("provider", "openrouter")).strip().lower()
+        default_model = str(item.get("default_model", DEFAULT_MODEL)).strip() or DEFAULT_MODEL
+        available_models = item.get("available_models")
+        if not isinstance(available_models, list) or not available_models:
+            available_models = [default_model]
+
+        base_url = str(item.get("base_url", UPSTREAM_BASE_URL)).strip().rstrip("/")
+        chat_url = str(item.get("chat_url", "")).strip() or f"{base_url}/chat/completions"
+        models_url = str(item.get("models_url", "")).strip() or f"{base_url}/models"
+        timeout = float(item.get("timeout", UPSTREAM_TIMEOUT))
+
+        keys = item.get("api_keys")
+        if not isinstance(keys, list):
+            one_key = str(item.get("api_key", "")).strip()
+            keys = [one_key] if one_key else []
+        keys = [str(k).strip() for k in keys if str(k).strip()]
+
+        headers = item.get("extra_headers", {})
+        if not isinstance(headers, dict):
+            headers = {}
+
+        routes[token] = RouteConfig(
+            token=token,
+            provider=provider,
+            default_model=default_model,
+            available_models=[str(m).strip() for m in available_models if str(m).strip()] or [default_model],
+            base_url=base_url,
+            chat_url=chat_url,
+            models_url=models_url,
+            timeout=timeout,
+            api_keys=keys,
+            extra_headers={str(k): str(v) for k, v in headers.items()},
+        )
+
+    legacy_route = _build_legacy_route()
+    if legacy_route and legacy_route.token not in routes:
+        routes[legacy_route.token] = legacy_route
+
+    if not routes:
+        raise RuntimeError("Missing gateway auth config. Set GATEWAY_ROUTES or GATEWAY_TOKEN")
+
+    return routes
+
+
+ROUTES_BY_TOKEN = _parse_gateway_routes()
 
 
 class ChatMessage(BaseModel):
@@ -104,21 +229,13 @@ def _pick_key(keys: list[str], request_id: str) -> str | None:
     return keys[idx]
 
 
-def _resolve_upstream_api_key() -> str | None:
-    for key_name in ("OPENROUTER_API_KEY", "UPSTREAM_API_KEY", "OPENAI_API_KEY"):
-        value = os.getenv(key_name, "").strip()
-        if value:
-            return value
-    return None
-
-
-def _upstream_headers(api_key: str) -> dict[str, str]:
-    return {
+def _upstream_headers(api_key: str, route: RouteConfig) -> dict[str, str]:
+    headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
-        "HTTP-Referer": OPENROUTER_REFERER,
-        "X-Title": OPENROUTER_TITLE,
     }
+    headers.update(route.extra_headers)
+    return headers
 
 
 async def _aclose_upstream_response(resp: httpx.Response, client: httpx.AsyncClient) -> None:
@@ -129,12 +246,19 @@ async def _aclose_upstream_response(resp: httpx.Response, client: httpx.AsyncCli
 def _check_gateway_key(
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
     authorization: str | None = Header(default=None, alias="Authorization"),
-) -> None:
+) -> RouteConfig:
     bearer = None
     if authorization and authorization.lower().startswith("bearer "):
         bearer = authorization.split(" ", 1)[1].strip()
-    if x_api_key != GATEWAY_TOKEN and bearer != GATEWAY_TOKEN:
+
+    token = x_api_key or bearer
+    if not token:
         raise HTTPException(status_code=401, detail="Unauthorized")
+
+    route = ROUTES_BY_TOKEN.get(token)
+    if not route:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    return route
 
 
 def _extract_prompt(messages: list[ChatMessage]) -> str:
@@ -157,54 +281,48 @@ def _extract_prompt(messages: list[ChatMessage]) -> str:
     raise HTTPException(status_code=422, detail="messages must contain at least one user message with text content")
 
 
-async def _call_upstream(payload: OpenAIChatRequest, request_id: str) -> tuple[str, int, str]:
-    model = payload.model or DEFAULT_MODEL
+async def _call_upstream(payload: OpenAIChatRequest, request_id: str, route: RouteConfig) -> tuple[str, int, str]:
+    model = payload.model or route.default_model
+    api_key = _pick_key(route.api_keys, request_id)
+    if not api_key:
+        raise HTTPException(status_code=502, detail=f"Upstream {route.provider} not configured: missing API key")
 
-    if PROVIDER == "openrouter":
-        api_key = _pick_key(OPENROUTER_API_KEYS, request_id) or _resolve_upstream_api_key()
-        if not api_key:
-            raise HTTPException(status_code=502, detail="Upstream openrouter not configured: missing API key")
+    body: dict[str, Any] = {"model": model, "messages": [m.model_dump() for m in payload.messages]}
+    if payload.temperature is not None:
+        body["temperature"] = payload.temperature
+    if payload.max_tokens is not None:
+        body["max_tokens"] = payload.max_tokens
 
-        body: dict[str, Any] = {"model": model, "messages": [m.model_dump() for m in payload.messages]}
-        if payload.temperature is not None:
-            body["temperature"] = payload.temperature
-        if payload.max_tokens is not None:
-            body["max_tokens"] = payload.max_tokens
+    try:
+        async with httpx.AsyncClient(timeout=route.timeout) as client:
+            resp = await client.post(route.chat_url, headers=_upstream_headers(api_key, route), json=body)
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=502, detail=f"Upstream request failed: {exc.__class__.__name__}") from exc
 
-        try:
-            async with httpx.AsyncClient(timeout=OPENROUTER_TIMEOUT) as client:
-                resp = await client.post(CHAT_COMPLETIONS_URL, headers=_upstream_headers(api_key), json=body)
-        except httpx.RequestError as exc:
-            raise HTTPException(status_code=502, detail=f"Upstream request failed: {exc.__class__.__name__}") from exc
+    if resp.status_code >= 400:
+        detail = _mask_detail(resp.text[:500], route.api_keys)
+        raise HTTPException(status_code=502, detail=f"Upstream {route.provider} error {resp.status_code}: {detail}")
 
-        if resp.status_code >= 400:
-            detail = _mask_detail(resp.text[:500], OPENROUTER_API_KEYS)
-            raise HTTPException(status_code=502, detail=f"Upstream openrouter error {resp.status_code}: {detail}")
+    try:
+        data = resp.json()
+        reply = data["choices"][0]["message"]["content"]
+        if not isinstance(reply, str):
+            reply = json.dumps(reply, ensure_ascii=False)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"Upstream {route.provider} returned invalid response format") from exc
 
-        try:
-            data = resp.json()
-            reply = data["choices"][0]["message"]["content"]
-        except Exception as exc:  # noqa: BLE001
-            raise HTTPException(status_code=502, detail="Upstream openrouter returned invalid response format") from exc
-
-        return reply, resp.status_code, model
-
-    if PROVIDER == "gemini":
-        prompt = _extract_prompt(payload.messages)
-        return f"[gemini-placeholder] {prompt}", 200, model
-
-    raise HTTPException(status_code=502, detail=f"Unsupported provider: {PROVIDER}")
+    return reply, resp.status_code, model
 
 
-async def _process_chat(payload: OpenAIChatRequest, request: Request) -> dict[str, Any]:
+async def _process_chat(payload: OpenAIChatRequest, request: Request, route: RouteConfig) -> dict[str, Any]:
     request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
     start = time.perf_counter()
     prompt = _extract_prompt(payload.messages)
     upstream_status = 0
-    model = payload.model or DEFAULT_MODEL
+    model = payload.model or route.default_model
 
     try:
-        reply, upstream_status, model = await _call_upstream(payload, request_id)
+        reply, upstream_status, model = await _call_upstream(payload, request_id, route)
     finally:
         duration_ms = round((time.perf_counter() - start) * 1000, 2)
         logger.info(
@@ -212,7 +330,7 @@ async def _process_chat(payload: OpenAIChatRequest, request: Request) -> dict[st
             request_id,
             request.url.path,
             duration_ms,
-            PROVIDER,
+            route.provider,
             upstream_status,
             model,
             len(prompt),
@@ -224,7 +342,7 @@ async def _process_chat(payload: OpenAIChatRequest, request: Request) -> dict[st
         "model": model,
         "duration_ms": duration_ms,
         "upstream_status": upstream_status,
-        "provider": PROVIDER,
+        "provider": route.provider,
     }
 
 
@@ -238,7 +356,8 @@ async def request_context(request: Request, call_next):
 
 @app.get("/")
 def root():
-    return {"project": PROJECT_NAME, "time": datetime.now(timezone.utc).isoformat(), "provider": PROVIDER}
+    providers = sorted({r.provider for r in ROUTES_BY_TOKEN.values()})
+    return {"project": PROJECT_NAME, "time": datetime.now(timezone.utc).isoformat(), "providers": providers}
 
 
 @app.get("/health")
@@ -246,18 +365,19 @@ def health():
     return {"ok": True}
 
 
-@app.get("/v1/models", dependencies=[Depends(_check_gateway_key)])
-async def list_models():
-    upstream_key = _resolve_upstream_api_key()
+@app.get("/v1/models")
+async def list_models(route: RouteConfig = Depends(_check_gateway_key)):
+    request_id = str(uuid.uuid4())
+    upstream_key = _pick_key(route.api_keys, request_id)
     if not upstream_key:
-        raise HTTPException(status_code=502, detail="Upstream key is not configured")
+        raise HTTPException(status_code=502, detail=f"Upstream {route.provider} key is not configured")
 
-    models_url = f"{UPSTREAM_BASE_URL}/models"
     headers = {"Authorization": f"Bearer {upstream_key}"}
+    headers.update(route.extra_headers)
 
     try:
-        async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT) as client:
-            upstream_resp = await client.get(models_url, headers=headers)
+        async with httpx.AsyncClient(timeout=route.timeout) as client:
+            upstream_resp = await client.get(route.models_url, headers=headers)
     except Exception as exc:  # noqa: BLE001
         logger.warning("/v1/models upstream request failed: %s", exc.__class__.__name__)
         raise HTTPException(status_code=502, detail="Upstream error") from exc
@@ -275,8 +395,8 @@ async def list_models():
         raise HTTPException(status_code=502, detail="Upstream error") from exc
 
 
-@app.post("/chat", response_model=ChatOut, dependencies=[Depends(_check_gateway_key)])
-async def chat(payload: ChatIn, request: Request):
+@app.post("/chat", response_model=ChatOut)
+async def chat(payload: ChatIn, request: Request, route: RouteConfig = Depends(_check_gateway_key)):
     messages: list[ChatMessage] = []
     if payload.system:
         messages.append(ChatMessage(role="system", content=payload.system))
@@ -287,16 +407,16 @@ async def chat(payload: ChatIn, request: Request):
         temperature=payload.temperature,
         max_tokens=payload.max_tokens,
     )
-    result = await _process_chat(normalized, request)
+    result = await _process_chat(normalized, request, route)
     return ChatOut(**result)
 
 
-@app.post("/v1/chat/completions", dependencies=[Depends(_check_gateway_key)])
-async def chat_completions(request: Request):
+@app.post("/v1/chat/completions")
+async def chat_completions(request: Request, route: RouteConfig = Depends(_check_gateway_key)):
     request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
-    api_key = _pick_key(OPENROUTER_API_KEYS, request_id) or _resolve_upstream_api_key()
+    api_key = _pick_key(route.api_keys, request_id)
     if not api_key:
-        raise HTTPException(status_code=502, detail="Upstream openrouter not configured: missing API key")
+        raise HTTPException(status_code=502, detail=f"Upstream {route.provider} not configured: missing API key")
 
     try:
         payload = await request.json()
@@ -306,13 +426,13 @@ async def chat_completions(request: Request):
     if not isinstance(payload, dict):
         raise HTTPException(status_code=422, detail="Request body must be a JSON object")
 
-    headers = _upstream_headers(api_key)
+    headers = _upstream_headers(api_key, route)
     stream = bool(payload.get("stream"))
 
     if not stream:
         try:
-            async with httpx.AsyncClient(timeout=OPENROUTER_TIMEOUT) as client:
-                upstream_resp = await client.post(CHAT_COMPLETIONS_URL, headers=headers, json=payload)
+            async with httpx.AsyncClient(timeout=route.timeout) as client:
+                upstream_resp = await client.post(route.chat_url, headers=headers, json=payload)
         except httpx.RequestError as exc:
             logger.warning("/v1/chat/completions upstream request failed: %s", exc.__class__.__name__)
             raise HTTPException(status_code=502, detail="Upstream error") from exc
@@ -326,8 +446,8 @@ async def chat_completions(request: Request):
 
     client: httpx.AsyncClient | None = None
     try:
-        client = httpx.AsyncClient(timeout=OPENROUTER_TIMEOUT)
-        req = client.build_request("POST", CHAT_COMPLETIONS_URL, headers=headers, json=payload)
+        client = httpx.AsyncClient(timeout=route.timeout)
+        req = client.build_request("POST", route.chat_url, headers=headers, json=payload)
         upstream_resp = await client.send(req, stream=True)
     except httpx.RequestError as exc:
         if client is not None:

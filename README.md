@@ -2,6 +2,8 @@
 
 一个自用 OpenAI 兼容网关，适合部署在 VPS（Docker Compose + 反向代理 + HTTPS）。
 
+现在支持：**多个网关 Token 对应多个上游配置**（如 OpenRouter / 硅基流动 / Gemini / 其他 OpenAI 兼容中转）。
+
 ## 已实现接口
 - `GET /`
 - `GET /health`（不鉴权，方便探活）
@@ -11,8 +13,8 @@
 
 ## 鉴权
 支持以下任意一种请求头：
-- `X-API-Key: <GATEWAY_TOKEN>`
-- `Authorization: Bearer <GATEWAY_TOKEN>`
+- `X-API-Key: <gateway_token>`
+- `Authorization: Bearer <gateway_token>`
 
 鉴权失败返回 `401` JSON，不会返回 500。
 
@@ -23,12 +25,52 @@
 cp .env.example .env
 ```
 
-必须至少填写：
-- `GATEWAY_TOKEN`
-- `PROVIDER`（`openrouter` 或 `gemini`）
-- 对应 provider 的 key（如 `OPENROUTER_API_KEY`）
+### 推荐：多 token + 多上游
 
-> 支持多 key：例如 `OPENROUTER_API_KEYS=key1,key2`，服务会按 request_id 做稳定轮询。
+在 `.env` 中配置 `GATEWAY_ROUTES`（JSON）：
+
+```json
+[
+  {
+    "token": "gw_or_001",
+    "provider": "openrouter",
+    "base_url": "https://openrouter.ai/api/v1",
+    "default_model": "openai/gpt-4o-mini",
+    "api_keys": ["or-key-1", "or-key-2"],
+    "timeout": 60,
+    "extra_headers": {
+      "HTTP-Referer": "https://your-domain.example",
+      "X-Title": "ai-gateway"
+    }
+  },
+  {
+    "token": "gw_sf_001",
+    "provider": "siliconflow",
+    "base_url": "https://api.siliconflow.cn/v1",
+    "default_model": "deepseek-ai/DeepSeek-V3",
+    "api_keys": ["sf-key-1"]
+  },
+  {
+    "token": "gw_gm_001",
+    "provider": "gemini",
+    "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+    "default_model": "gemini-2.0-flash",
+    "api_keys": ["gemini-key-1"]
+  }
+]
+```
+
+说明：
+- 每个 `token` 是你给客户端发放的“网关密钥”。
+- 每个 route 可绑定自己的 `provider / base_url / default_model / api_keys / timeout / extra_headers`。
+- `chat_url`、`models_url` 可不填，默认由 `base_url` 自动拼成：
+  - `chat_url = {base_url}/chat/completions`
+  - `models_url = {base_url}/models`
+- 同一路由下如果配置多个 `api_keys`，网关会按 `request_id` 稳定轮询。
+
+### 兼容旧版：单 token
+
+仍支持旧配置（`GATEWAY_TOKEN + PROVIDER + OPENROUTER_API_KEY` 等）。未配置 `GATEWAY_ROUTES` 时，会自动走旧逻辑。
 
 ## Docker 部署（VPS）
 ```bash
@@ -56,6 +98,30 @@ curl -i http://127.0.0.1:8000/chat \
   -H "X-API-Key: ${TOKEN}" \
   -d '{"message":"你好"}'
 ```
+
+## 多 token 实战示例
+
+假设你发了两个 token：
+- `gw_or_001` → OpenRouter
+- `gw_sf_001` → 硅基流动
+
+那调用时只需要替换请求头里的 token：
+
+```bash
+# 走 OpenRouter
+curl -sS http://127.0.0.1:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: gw_or_001" \
+  -d '{"messages":[{"role":"user","content":"hello"}]}'
+
+# 走硅基流动
+curl -sS http://127.0.0.1:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: gw_sf_001" \
+  -d '{"messages":[{"role":"user","content":"hello"}]}'
+```
+
+> 是否走哪个上游，完全由网关 token 决定，不需要客户端关心真实上游 key。
 
 ## 最短验证命令（线上域名 + HTTPS）
 ```bash
