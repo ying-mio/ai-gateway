@@ -202,13 +202,15 @@ curl -sS https://openrouter.ai/api/v1/models \
 
 网关会把请求头中的 gateway token（`X-API-Key` 或 `Authorization: Bearer`）直接当作 `tenant_id`。这样每个 token 的 persona / memories / conversations / messages 天然隔离。
 
-### 1) 建表
+### 1) migration 执行步骤
 
 在 Supabase SQL Editor 执行：
 
-- `migrations/001_supabase_memory.sql`
+1. 打开 `migrations/001_supabase_memory.sql`
+2. 全量执行 SQL（包含 personas / memories / conversations / messages）
+3. 确认四张表已创建，且唯一键/索引生效
 
-### 2) 配置
+### 2) Supabase env 配置
 
 在 `.env` 中增加：
 
@@ -217,11 +219,14 @@ SUPABASE_URL=https://your-project-ref.supabase.co
 SUPABASE_SERVICE_ROLE_KEY=your-service-role-key
 SUPABASE_TIMEOUT=5
 MEMORY_MAX_ITEMS=20
+DEBUG=false
 ```
 
 说明：
-- Supabase 异常/超时时，`/v1/chat/completions` 仍会继续纯转发，不会阻断主链路。
+- Supabase 异常/超时时，`/v1/chat/completions` 会降级为纯转发，不会阻断主链路。
+- 响应头会追加 `X-Store: ok|degraded` 用于观察存储链路状态。
 - service role key 只在后端使用，不会返回给客户端。
+- `DEBUG=true` 时会输出更详细的 Supabase 错误日志。
 
 ### 3) Chat 注入与存档行为
 
@@ -229,9 +234,9 @@ MEMORY_MAX_ITEMS=20
 1. 用 gateway token 解析 `tenant_id`
 2. 读取 `personas.system_prompt`
 3. 读取 `memories`（按 `weight desc, created_at desc`，最多 `MEMORY_MAX_ITEMS`）
-4. 将 persona + memories 组装为首条 `system` 消息注入后转发上游
-5. 非流式响应成功后，自动存档 user/assistant 到 `messages`；若缺少 `conversation_id` 会自动创建
-6. 响应头返回 `X-Conversation-ID`
+4. 若 `messages[0]` 已是 system，则把注入内容 append 到原有 system；否则新增一条 system
+5. `stream=false` 与 `stream=true` 都会在成功后存档 user/assistant 到 `messages`（含 usage 到 `token_usage`）
+6. 响应头返回 `X-Conversation-ID` 和 `X-Store`
 
 ### 4) 管理 API（均按当前 token 的 tenant_id 隔离）
 
@@ -244,7 +249,7 @@ MEMORY_MAX_ITEMS=20
 - `GET /admin/conversations`
 - `GET /admin/conversations/{id}/messages`
 
-## Supabase MVP curl 用例
+## Supabase 验证步骤
 
 ```bash
 export BASE_URL='http://127.0.0.1:8000'
@@ -257,24 +262,20 @@ curl -sS "${BASE_URL}/admin/persona" \
   -H "X-API-Key: ${TOKEN}" \
   -d '{"name":"OR 租户","system_prompt":"你是该租户的专属助手，保持专业简洁。"}'
 
-# 2) 写入 memory
+# 2) 写 memory
 curl -sS "${BASE_URL}/admin/memories" \
   -X POST \
   -H "Content-Type: application/json" \
   -H "X-API-Key: ${TOKEN}" \
   -d '{"title":"品牌语气","content":"偏技术理性，少用感叹号。","tags":["brand","style"],"weight":100}'
 
-# 3) 发起聊天（会自动注入 persona+memory 并存档）
+# 3) 发起聊天（查看响应头 X-Conversation-ID 与 X-Store）
 curl -i "${BASE_URL}/v1/chat/completions" \
   -H "Content-Type: application/json" \
   -H "X-API-Key: ${TOKEN}" \
   -d '{"model":"openai/gpt-4o-mini","messages":[{"role":"user","content":"写一段新品发布开场白"}]}'
 
-# 4) 查看会话列表
-curl -sS "${BASE_URL}/admin/conversations" \
-  -H "X-API-Key: ${TOKEN}"
-
-# 5) 查看某个会话消息（替换 conv_id）
+# 4) 使用上一步响应头中的 X-Conversation-ID 查询 messages
 curl -sS "${BASE_URL}/admin/conversations/<conv_id>/messages" \
   -H "X-API-Key: ${TOKEN}"
 ```
