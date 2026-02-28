@@ -63,6 +63,11 @@ class RouteConfig(BaseModel):
     extra_headers: dict[str, str] = {}
 
 
+class TenantContext(BaseModel):
+    tenant_id: str
+    route: RouteConfig
+
+
 def _resolve_upstream_api_key() -> str | None:
     for key_name in ("OPENROUTER_API_KEY", "UPSTREAM_API_KEY", "OPENAI_API_KEY"):
         value = os.getenv(key_name, "").strip()
@@ -176,6 +181,10 @@ def _parse_gateway_routes() -> dict[str, RouteConfig]:
 
 
 ROUTES_BY_TOKEN = _parse_gateway_routes()
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+SUPABASE_TIMEOUT = float(os.getenv("SUPABASE_TIMEOUT", "5"))
+MEMORY_MAX_ITEMS = int(os.getenv("MEMORY_MAX_ITEMS", "20"))
 
 
 class ChatMessage(BaseModel):
@@ -211,7 +220,181 @@ class ChatOut(BaseModel):
     provider: str
 
 
+class PersonaUpdate(BaseModel):
+    name: str | None = None
+    system_prompt: str = ""
+
+
+class MemoryCreate(BaseModel):
+    title: str
+    content: str
+    tags: list[str] = []
+    weight: int = 0
+
+
+class MemoryUpdate(BaseModel):
+    title: str | None = None
+    content: str | None = None
+    tags: list[str] | None = None
+    weight: int | None = None
+
+
 app = FastAPI(title="AI Gateway")
+
+
+class SupabaseStore:
+    def __init__(self, url: str, service_role_key: str, timeout: float = 5) -> None:
+        self.enabled = bool(url and service_role_key)
+        self.url = f"{url}/rest/v1" if self.enabled else ""
+        self.timeout = timeout
+        self._headers = {
+            "apikey": service_role_key,
+            "Authorization": f"Bearer {service_role_key}",
+            "Content-Type": "application/json",
+            "Prefer": "return=representation",
+        }
+
+    async def _request(
+        self,
+        method: str,
+        table: str,
+        params: dict[str, str] | None = None,
+        json_body: Any | None = None,
+        prefer: str | None = None,
+    ) -> list[dict[str, Any]]:
+        if not self.enabled:
+            return []
+
+        headers = dict(self._headers)
+        if prefer:
+            headers["Prefer"] = prefer
+
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                resp = await client.request(
+                    method,
+                    f"{self.url}/{table}",
+                    params=params,
+                    json=json_body,
+                    headers=headers,
+                )
+                resp.raise_for_status()
+                if not resp.content:
+                    return []
+                data = resp.json()
+                if isinstance(data, list):
+                    return data
+                if isinstance(data, dict):
+                    return [data]
+                return []
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("supabase %s %s failed: %s", method, table, exc.__class__.__name__)
+            return []
+
+    async def get_persona(self, tenant_id: str) -> dict[str, Any] | None:
+        rows = await self._request("GET", "personas", params={"tenant_id": f"eq.{tenant_id}", "limit": "1"})
+        return rows[0] if rows else None
+
+    async def upsert_persona(self, tenant_id: str, name: str | None, system_prompt: str) -> dict[str, Any]:
+        payload = {
+            "tenant_id": tenant_id,
+            "name": name or tenant_id,
+            "system_prompt": system_prompt,
+        }
+        rows = await self._request(
+            "POST",
+            "personas",
+            json_body=payload,
+            prefer="resolution=merge-duplicates,return=representation",
+        )
+        return rows[0] if rows else payload
+
+    async def get_memories(self, tenant_id: str, limit: int) -> list[dict[str, Any]]:
+        params = {
+            "tenant_id": f"eq.{tenant_id}",
+            "order": "weight.desc,created_at.desc",
+            "limit": str(limit),
+        }
+        return await self._request("GET", "memories", params=params)
+
+    async def create_memory(self, tenant_id: str, payload: MemoryCreate) -> dict[str, Any] | None:
+        rows = await self._request(
+            "POST",
+            "memories",
+            json_body={
+                "tenant_id": tenant_id,
+                "title": payload.title,
+                "content": payload.content,
+                "tags": payload.tags,
+                "weight": payload.weight,
+            },
+        )
+        return rows[0] if rows else None
+
+    async def update_memory(self, tenant_id: str, memory_id: int, payload: MemoryUpdate) -> dict[str, Any] | None:
+        data = payload.model_dump(exclude_none=True)
+        if not data:
+            return None
+        rows = await self._request(
+            "PATCH",
+            "memories",
+            params={"tenant_id": f"eq.{tenant_id}", "id": f"eq.{memory_id}"},
+            json_body=data,
+        )
+        return rows[0] if rows else None
+
+    async def delete_memory(self, tenant_id: str, memory_id: int) -> bool:
+        rows = await self._request(
+            "DELETE",
+            "memories",
+            params={"tenant_id": f"eq.{tenant_id}", "id": f"eq.{memory_id}"},
+            prefer="return=representation",
+        )
+        return bool(rows)
+
+    async def ensure_conversation(self, tenant_id: str, conversation_id: str | None) -> str:
+        if conversation_id:
+            rows = await self._request(
+                "GET",
+                "conversations",
+                params={"tenant_id": f"eq.{tenant_id}", "id": f"eq.{conversation_id}", "limit": "1"},
+            )
+            if rows:
+                return conversation_id
+
+        conversation_id = str(uuid.uuid4())
+        await self._request(
+            "POST",
+            "conversations",
+            json_body={"id": conversation_id, "tenant_id": tenant_id},
+        )
+        return conversation_id
+
+    async def insert_messages(self, messages: list[dict[str, Any]]) -> None:
+        if not messages:
+            return
+        await self._request("POST", "messages", json_body=messages)
+
+    async def list_conversations(self, tenant_id: str, limit: int = 50) -> list[dict[str, Any]]:
+        return await self._request(
+            "GET",
+            "conversations",
+            params={"tenant_id": f"eq.{tenant_id}", "order": "created_at.desc", "limit": str(limit)},
+        )
+
+    async def list_messages(self, tenant_id: str, conversation_id: str) -> list[dict[str, Any]]:
+        return await self._request(
+            "GET",
+            "messages",
+            params={
+                "tenant_id": f"eq.{tenant_id}",
+                "conversation_id": f"eq.{conversation_id}",
+                "order": "created_at.asc",
+            },
+        )
+
+
+store = SupabaseStore(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, timeout=SUPABASE_TIMEOUT)
 
 
 def _mask_detail(text: str, keys: list[str]) -> str:
@@ -246,7 +429,7 @@ async def _aclose_upstream_response(resp: httpx.Response, client: httpx.AsyncCli
 def _check_gateway_key(
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
     authorization: str | None = Header(default=None, alias="Authorization"),
-) -> RouteConfig:
+) -> TenantContext:
     bearer = None
     if authorization and authorization.lower().startswith("bearer "):
         bearer = authorization.split(" ", 1)[1].strip()
@@ -258,7 +441,64 @@ def _check_gateway_key(
     route = ROUTES_BY_TOKEN.get(token)
     if not route:
         raise HTTPException(status_code=401, detail="Unauthorized")
-    return route
+    return TenantContext(tenant_id=token, route=route)
+
+
+def _build_memory_system_prompt(system_prompt: str, memories: list[dict[str, Any]]) -> str:
+    chunks: list[str] = []
+    if system_prompt.strip():
+        chunks.append(system_prompt.strip())
+
+    if memories:
+        chunks.append("以下是和当前租户相关的长期记忆，请优先参考：")
+        for idx, memory in enumerate(memories, start=1):
+            title = memory.get("title") or f"memory-{idx}"
+            content = str(memory.get("content", "")).strip()
+            tags = memory.get("tags") or []
+            tag_text = f" [tags: {', '.join(str(t) for t in tags)}]" if tags else ""
+            chunks.append(f"{idx}. {title}{tag_text}: {content}")
+
+    return "\n\n".join([item for item in chunks if item])
+
+
+def _inject_system_message(payload: dict[str, Any], system_text: str) -> dict[str, Any]:
+    if not system_text.strip():
+        return payload
+
+    new_payload = dict(payload)
+    messages = payload.get("messages", [])
+    if not isinstance(messages, list):
+        messages = []
+    new_payload["messages"] = [{"role": "system", "content": system_text}, *messages]
+    return new_payload
+
+
+def _extract_last_user_content(messages: list[dict[str, Any]]) -> str:
+    for msg in reversed(messages):
+        if msg.get("role") != "user":
+            continue
+        content = msg.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            texts = [item.get("text", "") for item in content if isinstance(item, dict)]
+            return "\n".join([str(t) for t in texts if str(t).strip()])
+    return ""
+
+
+def _extract_assistant_content(resp_json: dict[str, Any]) -> str:
+    try:
+        content = resp_json["choices"][0]["message"]["content"]
+        if isinstance(content, str):
+            return content
+        return json.dumps(content, ensure_ascii=False)
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _extract_usage(resp_json: dict[str, Any]) -> dict[str, Any] | None:
+    usage = resp_json.get("usage")
+    return usage if isinstance(usage, dict) else None
 
 
 def _extract_prompt(messages: list[ChatMessage]) -> str:
@@ -366,7 +606,8 @@ def health():
 
 
 @app.get("/v1/models")
-async def list_models(route: RouteConfig = Depends(_check_gateway_key)):
+async def list_models(ctx: TenantContext = Depends(_check_gateway_key)):
+    route = ctx.route
     request_id = str(uuid.uuid4())
     upstream_key = _pick_key(route.api_keys, request_id)
     if not upstream_key:
@@ -396,7 +637,7 @@ async def list_models(route: RouteConfig = Depends(_check_gateway_key)):
 
 
 @app.post("/chat", response_model=ChatOut)
-async def chat(payload: ChatIn, request: Request, route: RouteConfig = Depends(_check_gateway_key)):
+async def chat(payload: ChatIn, request: Request, ctx: TenantContext = Depends(_check_gateway_key)):
     messages: list[ChatMessage] = []
     if payload.system:
         messages.append(ChatMessage(role="system", content=payload.system))
@@ -407,12 +648,14 @@ async def chat(payload: ChatIn, request: Request, route: RouteConfig = Depends(_
         temperature=payload.temperature,
         max_tokens=payload.max_tokens,
     )
-    result = await _process_chat(normalized, request, route)
+    result = await _process_chat(normalized, request, ctx.route)
     return ChatOut(**result)
 
 
 @app.post("/v1/chat/completions")
-async def chat_completions(request: Request, route: RouteConfig = Depends(_check_gateway_key)):
+async def chat_completions(request: Request, ctx: TenantContext = Depends(_check_gateway_key)):
+    route = ctx.route
+    tenant_id = ctx.tenant_id
     request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
     api_key = _pick_key(route.api_keys, request_id)
     if not api_key:
@@ -426,6 +669,14 @@ async def chat_completions(request: Request, route: RouteConfig = Depends(_check
     if not isinstance(payload, dict):
         raise HTTPException(status_code=422, detail="Request body must be a JSON object")
 
+    conversation_id = payload.pop("conversation_id", None)
+    user_message = _extract_last_user_content(payload.get("messages", []))
+
+    persona = await store.get_persona(tenant_id)
+    memories = await store.get_memories(tenant_id, MEMORY_MAX_ITEMS)
+    injected_system = _build_memory_system_prompt((persona or {}).get("system_prompt", ""), memories)
+    payload = _inject_system_message(payload, injected_system)
+
     headers = _upstream_headers(api_key, route)
     stream = bool(payload.get("stream"))
 
@@ -438,11 +689,42 @@ async def chat_completions(request: Request, route: RouteConfig = Depends(_check
             raise HTTPException(status_code=502, detail="Upstream error") from exc
 
         content_type = upstream_resp.headers.get("content-type", "application/json")
-        return Response(
+        response = Response(
             content=upstream_resp.content,
             status_code=upstream_resp.status_code,
             media_type=content_type.split(";", 1)[0],
         )
+        response.headers["X-Conversation-ID"] = conversation_id or ""
+
+        if upstream_resp.status_code < 400:
+            try:
+                resp_json = upstream_resp.json()
+                assistant_message = _extract_assistant_content(resp_json)
+                usage = _extract_usage(resp_json)
+                conv_id = await store.ensure_conversation(tenant_id, conversation_id)
+                await store.insert_messages(
+                    [
+                        {
+                            "conversation_id": conv_id,
+                            "tenant_id": tenant_id,
+                            "role": "user",
+                            "content": user_message,
+                            "model": payload.get("model") or route.default_model,
+                        },
+                        {
+                            "conversation_id": conv_id,
+                            "tenant_id": tenant_id,
+                            "role": "assistant",
+                            "content": assistant_message,
+                            "model": payload.get("model") or route.default_model,
+                            "token_usage": usage,
+                        },
+                    ]
+                )
+                response.headers["X-Conversation-ID"] = conv_id
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("message archive failed: %s", exc.__class__.__name__)
+        return response
 
     client: httpx.AsyncClient | None = None
     try:
@@ -469,3 +751,55 @@ async def chat_completions(request: Request, route: RouteConfig = Depends(_check
         media_type=content_type.split(";", 1)[0],
         background=BackgroundTask(_aclose_upstream_response, upstream_resp, client),
     )
+
+
+@app.get("/admin/persona")
+async def get_persona(ctx: TenantContext = Depends(_check_gateway_key)):
+    persona = await store.get_persona(ctx.tenant_id)
+    return persona or {"tenant_id": ctx.tenant_id, "name": ctx.tenant_id, "system_prompt": ""}
+
+
+@app.put("/admin/persona")
+async def put_persona(payload: PersonaUpdate, ctx: TenantContext = Depends(_check_gateway_key)):
+    return await store.upsert_persona(ctx.tenant_id, payload.name, payload.system_prompt)
+
+
+@app.get("/admin/memories")
+async def get_memories(limit: int = MEMORY_MAX_ITEMS, ctx: TenantContext = Depends(_check_gateway_key)):
+    safe_limit = max(1, min(limit, 200))
+    return await store.get_memories(ctx.tenant_id, safe_limit)
+
+
+@app.post("/admin/memories")
+async def post_memory(payload: MemoryCreate, ctx: TenantContext = Depends(_check_gateway_key)):
+    memory = await store.create_memory(ctx.tenant_id, payload)
+    if not memory:
+        raise HTTPException(status_code=503, detail="memory storage unavailable")
+    return memory
+
+
+@app.put("/admin/memories/{memory_id}")
+async def put_memory(memory_id: int, payload: MemoryUpdate, ctx: TenantContext = Depends(_check_gateway_key)):
+    memory = await store.update_memory(ctx.tenant_id, memory_id, payload)
+    if not memory:
+        raise HTTPException(status_code=404, detail="memory not found")
+    return memory
+
+
+@app.delete("/admin/memories/{memory_id}")
+async def delete_memory(memory_id: int, ctx: TenantContext = Depends(_check_gateway_key)):
+    deleted = await store.delete_memory(ctx.tenant_id, memory_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="memory not found")
+    return {"ok": True}
+
+
+@app.get("/admin/conversations")
+async def get_conversations(limit: int = 50, ctx: TenantContext = Depends(_check_gateway_key)):
+    safe_limit = max(1, min(limit, 200))
+    return await store.list_conversations(ctx.tenant_id, safe_limit)
+
+
+@app.get("/admin/conversations/{conversation_id}/messages")
+async def get_conversation_messages(conversation_id: str, ctx: TenantContext = Depends(_check_gateway_key)):
+    return await store.list_messages(ctx.tenant_id, conversation_id)
