@@ -11,12 +11,12 @@ from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict
-from starlette.background import BackgroundTask
 
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("ai_gateway")
+DEBUG_MODE = os.getenv("DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}
 
 PROJECT_NAME = "ai-gateway"
 
@@ -261,9 +261,9 @@ class SupabaseStore:
         params: dict[str, str] | None = None,
         json_body: Any | None = None,
         prefer: str | None = None,
-    ) -> list[dict[str, Any]]:
+    ) -> tuple[list[dict[str, Any]], bool]:
         if not self.enabled:
-            return []
+            return [], False
 
         headers = dict(self._headers)
         if prefer:
@@ -280,20 +280,26 @@ class SupabaseStore:
                 )
                 resp.raise_for_status()
                 if not resp.content:
-                    return []
+                    return [], True
                 data = resp.json()
                 if isinstance(data, list):
-                    return data
+                    return data, True
                 if isinstance(data, dict):
-                    return [data]
-                return []
+                    return [data], True
+                return [], True
         except Exception as exc:  # noqa: BLE001
             logger.warning("supabase %s %s failed: %s", method, table, exc.__class__.__name__)
-            return []
+            if DEBUG_MODE:
+                logger.debug("supabase request detail", exc_info=exc)
+            return [], False
 
     async def get_persona(self, tenant_id: str) -> dict[str, Any] | None:
-        rows = await self._request("GET", "personas", params={"tenant_id": f"eq.{tenant_id}", "limit": "1"})
+        rows, _ = await self._request("GET", "personas", params={"tenant_id": f"eq.{tenant_id}", "limit": "1"})
         return rows[0] if rows else None
+
+    async def get_persona_with_status(self, tenant_id: str) -> tuple[dict[str, Any] | None, bool]:
+        rows, ok = await self._request("GET", "personas", params={"tenant_id": f"eq.{tenant_id}", "limit": "1"})
+        return (rows[0] if rows else None), ok
 
     async def upsert_persona(self, tenant_id: str, name: str | None, system_prompt: str) -> dict[str, Any]:
         payload = {
@@ -301,7 +307,7 @@ class SupabaseStore:
             "name": name or tenant_id,
             "system_prompt": system_prompt,
         }
-        rows = await self._request(
+        rows, _ = await self._request(
             "POST",
             "personas",
             json_body=payload,
@@ -315,10 +321,19 @@ class SupabaseStore:
             "order": "weight.desc,created_at.desc",
             "limit": str(limit),
         }
+        rows, _ = await self._request("GET", "memories", params=params)
+        return rows
+
+    async def get_memories_with_status(self, tenant_id: str, limit: int) -> tuple[list[dict[str, Any]], bool]:
+        params = {
+            "tenant_id": f"eq.{tenant_id}",
+            "order": "weight.desc,created_at.desc",
+            "limit": str(limit),
+        }
         return await self._request("GET", "memories", params=params)
 
     async def create_memory(self, tenant_id: str, payload: MemoryCreate) -> dict[str, Any] | None:
-        rows = await self._request(
+        rows, _ = await self._request(
             "POST",
             "memories",
             json_body={
@@ -335,7 +350,7 @@ class SupabaseStore:
         data = payload.model_dump(exclude_none=True)
         if not data:
             return None
-        rows = await self._request(
+        rows, _ = await self._request(
             "PATCH",
             "memories",
             params={"tenant_id": f"eq.{tenant_id}", "id": f"eq.{memory_id}"},
@@ -344,7 +359,7 @@ class SupabaseStore:
         return rows[0] if rows else None
 
     async def delete_memory(self, tenant_id: str, memory_id: int) -> bool:
-        rows = await self._request(
+        rows, _ = await self._request(
             "DELETE",
             "memories",
             params={"tenant_id": f"eq.{tenant_id}", "id": f"eq.{memory_id}"},
@@ -354,36 +369,50 @@ class SupabaseStore:
 
     async def ensure_conversation(self, tenant_id: str, conversation_id: str | None) -> str:
         if conversation_id:
-            rows = await self._request(
+            rows, ok = await self._request(
                 "GET",
                 "conversations",
                 params={"tenant_id": f"eq.{tenant_id}", "id": f"eq.{conversation_id}", "limit": "1"},
             )
             if rows:
                 return conversation_id
+            if not ok:
+                raise RuntimeError("conversation lookup failed")
 
         conversation_id = str(uuid.uuid4())
-        await self._request(
+        _, ok = await self._request(
             "POST",
             "conversations",
             json_body={"id": conversation_id, "tenant_id": tenant_id},
         )
+        if not ok:
+            raise RuntimeError("conversation create failed")
         return conversation_id
 
     async def insert_messages(self, messages: list[dict[str, Any]]) -> None:
         if not messages:
             return
-        await self._request("POST", "messages", json_body=messages)
+        _, ok = await self._request("POST", "messages", json_body=messages)
+        if not ok:
+            raise RuntimeError("message insert failed")
 
     async def list_conversations(self, tenant_id: str, limit: int = 50) -> list[dict[str, Any]]:
-        return await self._request(
+        rows, _ = await self._request(
             "GET",
             "conversations",
             params={"tenant_id": f"eq.{tenant_id}", "order": "created_at.desc", "limit": str(limit)},
         )
+        return rows
 
     async def list_messages(self, tenant_id: str, conversation_id: str) -> list[dict[str, Any]]:
-        return await self._request(
+        convo_rows, _ = await self._request(
+            "GET",
+            "conversations",
+            params={"tenant_id": f"eq.{tenant_id}", "id": f"eq.{conversation_id}", "limit": "1"},
+        )
+        if not convo_rows:
+            return []
+        rows, _ = await self._request(
             "GET",
             "messages",
             params={
@@ -392,6 +421,7 @@ class SupabaseStore:
                 "order": "created_at.asc",
             },
         )
+        return rows
 
 
 store = SupabaseStore(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, timeout=SUPABASE_TIMEOUT)
@@ -469,6 +499,21 @@ def _inject_system_message(payload: dict[str, Any], system_text: str) -> dict[st
     messages = payload.get("messages", [])
     if not isinstance(messages, list):
         messages = []
+
+    injected_block = f"\n\n[Injected Context]\n{system_text}"
+    if messages and isinstance(messages[0], dict) and messages[0].get("role") == "system":
+        merged = dict(messages[0])
+        current_content = merged.get("content")
+        if isinstance(current_content, str):
+            if injected_block not in current_content:
+                merged["content"] = f"{current_content.rstrip()}{injected_block}"
+        elif isinstance(current_content, list):
+            merged["content"] = [*current_content, {"type": "text", "text": injected_block}]
+        else:
+            merged["content"] = f"{injected_block.strip()}"
+        new_payload["messages"] = [merged, *messages[1:]]
+        return new_payload
+
     new_payload["messages"] = [{"role": "system", "content": system_text}, *messages]
     return new_payload
 
@@ -499,6 +544,90 @@ def _extract_assistant_content(resp_json: dict[str, Any]) -> str:
 def _extract_usage(resp_json: dict[str, Any]) -> dict[str, Any] | None:
     usage = resp_json.get("usage")
     return usage if isinstance(usage, dict) else None
+
+
+def _extract_stream_payload(data: str, content_parts: list[str], usage_holder: dict[str, Any]) -> None:
+    if not data or data == "[DONE]":
+        return
+    try:
+        parsed = json.loads(data)
+    except json.JSONDecodeError:
+        return
+
+    usage = parsed.get("usage")
+    if isinstance(usage, dict):
+        usage_holder.clear()
+        usage_holder.update(usage)
+
+    for choice in parsed.get("choices", []):
+        if not isinstance(choice, dict):
+            continue
+        delta = choice.get("delta")
+        if not isinstance(delta, dict):
+            continue
+        delta_content = delta.get("content")
+        if isinstance(delta_content, str):
+            content_parts.append(delta_content)
+        elif isinstance(delta_content, list):
+            for item in delta_content:
+                if isinstance(item, dict):
+                    text = item.get("text")
+                    if isinstance(text, str):
+                        content_parts.append(text)
+
+
+async def _stream_and_archive(
+    upstream_resp: httpx.Response,
+    client: httpx.AsyncClient,
+    tenant_id: str,
+    conversation_id: str | None,
+    user_message: str,
+    model: str,
+) -> Any:
+    buffer = ""
+    content_parts: list[str] = []
+    usage_holder: dict[str, Any] = {}
+
+    try:
+        async for chunk in upstream_resp.aiter_text():
+            buffer += chunk
+            while "\n" in buffer:
+                line, buffer = buffer.split("\n", 1)
+                stripped = line.strip()
+                if stripped.startswith("data:"):
+                    _extract_stream_payload(stripped[5:].strip(), content_parts, usage_holder)
+            yield chunk.encode("utf-8")
+        if buffer.strip().startswith("data:"):
+            _extract_stream_payload(buffer.strip()[5:].strip(), content_parts, usage_holder)
+
+        assistant_message = "".join(content_parts)
+        conv_id = await store.ensure_conversation(tenant_id, conversation_id)
+        usage_payload = usage_holder or None
+        await store.insert_messages(
+            [
+                {
+                    "conversation_id": conv_id,
+                    "tenant_id": tenant_id,
+                    "role": "user",
+                    "content": user_message,
+                    "model": model,
+                },
+                {
+                    "conversation_id": conv_id,
+                    "tenant_id": tenant_id,
+                    "role": "assistant",
+                    "content": assistant_message,
+                    "model": model,
+                    "token_usage": usage_payload,
+                },
+            ]
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("stream message archive failed: %s", exc.__class__.__name__)
+        if DEBUG_MODE:
+            logger.debug("stream archive detail", exc_info=exc)
+    finally:
+        await _aclose_upstream_response(upstream_resp, client)
 
 
 def _extract_prompt(messages: list[ChatMessage]) -> str:
@@ -672,8 +801,11 @@ async def chat_completions(request: Request, ctx: TenantContext = Depends(_check
     conversation_id = payload.pop("conversation_id", None)
     user_message = _extract_last_user_content(payload.get("messages", []))
 
-    persona = await store.get_persona(tenant_id)
-    memories = await store.get_memories(tenant_id, MEMORY_MAX_ITEMS)
+    store_status = "ok"
+    persona, persona_ok = await store.get_persona_with_status(tenant_id)
+    memories, memories_ok = await store.get_memories_with_status(tenant_id, MEMORY_MAX_ITEMS)
+    if not persona_ok or not memories_ok:
+        store_status = "degraded"
     injected_system = _build_memory_system_prompt((persona or {}).get("system_prompt", ""), memories)
     payload = _inject_system_message(payload, injected_system)
 
@@ -695,6 +827,7 @@ async def chat_completions(request: Request, ctx: TenantContext = Depends(_check
             media_type=content_type.split(";", 1)[0],
         )
         response.headers["X-Conversation-ID"] = conversation_id or ""
+        response.headers["X-Store"] = store_status
 
         if upstream_resp.status_code < 400:
             try:
@@ -724,6 +857,9 @@ async def chat_completions(request: Request, ctx: TenantContext = Depends(_check
                 response.headers["X-Conversation-ID"] = conv_id
             except Exception as exc:  # noqa: BLE001
                 logger.warning("message archive failed: %s", exc.__class__.__name__)
+                if DEBUG_MODE:
+                    logger.debug("message archive detail", exc_info=exc)
+                response.headers["X-Store"] = "degraded"
         return response
 
     client: httpx.AsyncClient | None = None
@@ -745,12 +881,15 @@ async def chat_completions(request: Request, ctx: TenantContext = Depends(_check
         return Response(content=body, status_code=upstream_resp.status_code, media_type=content_type.split(";", 1)[0])
 
     content_type = upstream_resp.headers.get("content-type", "text/event-stream")
-    return StreamingResponse(
-        upstream_resp.aiter_raw(),
+    model = payload.get("model") or route.default_model
+    response = StreamingResponse(
+        _stream_and_archive(upstream_resp, client, tenant_id, conversation_id, user_message, model),
         status_code=upstream_resp.status_code,
         media_type=content_type.split(";", 1)[0],
-        background=BackgroundTask(_aclose_upstream_response, upstream_resp, client),
     )
+    response.headers["X-Conversation-ID"] = conversation_id or ""
+    response.headers["X-Store"] = store_status
+    return response
 
 
 @app.get("/admin/persona")
